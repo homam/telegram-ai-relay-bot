@@ -1,10 +1,15 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type { ChatMessage } from '../sessions/types.js';
-import type { AIProvider, ProviderReply, ProviderStream } from './types.js';
+import type { AIProvider, ProviderReply, ProviderStream, SelectableModel } from './types.js';
 
 export class AnthropicProvider implements AIProvider {
   readonly id = 'anthropic' as const;
   readonly defaultModel: string;
+  readonly selectableModels: ReadonlyArray<SelectableModel> = [
+    { id: 'claude-haiku-4-5', label: 'Claude Haiku 4.5' },
+    { id: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
+    { id: 'claude-opus-4-7', label: 'Claude Opus 4.7' },
+  ];
   private client: Anthropic;
 
   constructor(apiKey: string, defaultModel = 'claude-haiku-4-5') {

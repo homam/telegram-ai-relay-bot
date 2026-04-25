@@ -1,10 +1,17 @@
 import OpenAI from 'openai';
 import type { ChatMessage } from '../sessions/types.js';
-import type { AIProvider, ProviderReply, ProviderStream } from './types.js';
+import type { AIProvider, ProviderReply, ProviderStream, SelectableModel } from './types.js';
 
 export class OpenAIProvider implements AIProvider {
   readonly id = 'openai' as const;
   readonly defaultModel: string;
+  readonly selectableModels: ReadonlyArray<SelectableModel> = [
+    { id: 'gpt-5.4', label: 'GPT-5.4' },
+    { id: 'gpt-5.4-mini', label: 'GPT-5.4 Mini' },
+    { id: 'gpt-5.4-nano', label: 'GPT-5.4 Nano' },
+    { id: 'gpt-5.4-pro', label: 'GPT-5.4 Pro' },
+    { id: 'gpt-5.5', label: 'GPT-5.5' },
+  ];
   private client: OpenAI;
 
   constructor(apiKey: string, defaultModel = 'gpt-5.4') {

@@ -46,6 +46,7 @@ export class DynamoSessionsRepo implements SessionsRepo {
       userId,
       activeProvider: i.activeProvider as ProviderId,
       activeSessionByProvider: i.activeSessionByProvider ?? {},
+      modelByProvider: i.modelByProvider ?? {},
       updatedAt: i.updatedAt as number,
     };
   }
@@ -59,6 +60,7 @@ export class DynamoSessionsRepo implements SessionsRepo {
           sk: stateSk(),
           activeProvider: s.activeProvider,
           activeSessionByProvider: s.activeSessionByProvider,
+          modelByProvider: s.modelByProvider,
           updatedAt: s.updatedAt,
         },
       }),

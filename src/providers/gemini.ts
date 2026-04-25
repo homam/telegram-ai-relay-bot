@@ -1,10 +1,14 @@
 import { GoogleGenAI } from '@google/genai';
 import type { ChatMessage } from '../sessions/types.js';
-import type { AIProvider, ProviderReply, ProviderStream } from './types.js';
+import type { AIProvider, ProviderReply, ProviderStream, SelectableModel } from './types.js';
 
 export class GeminiProvider implements AIProvider {
   readonly id = 'gemini' as const;
   readonly defaultModel: string;
+  readonly selectableModels: ReadonlyArray<SelectableModel> = [
+    { id: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash' },
+    { id: 'gemini-1.5-pro', label: 'Gemini 1.5 Pro' },
+  ];
   private client: GoogleGenAI;
 
   constructor(apiKey: string, defaultModel = 'gemini-2.0-flash') {

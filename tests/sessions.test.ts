@@ -33,11 +33,13 @@ describe('InMemorySessionsRepo', () => {
       userId: 1,
       activeProvider: 'anthropic',
       activeSessionByProvider: { anthropic: 's-a' },
+      modelByProvider: { anthropic: 'claude-sonnet-4-6' },
       updatedAt: 100,
     });
     const s = await repo.getState(1);
     expect(s?.activeProvider).toBe('anthropic');
     expect(s?.activeSessionByProvider.anthropic).toBe('s-a');
+    expect(s?.modelByProvider.anthropic).toBe('claude-sonnet-4-6');
   });
 
   it('lists sessions filtered by provider, sorted by lastUsedAt desc', async () => {

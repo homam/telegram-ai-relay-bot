@@ -15,7 +15,7 @@ import type { ProviderRegistry } from './providers/registry.js';
 import { PROVIDER_LABELS } from './providers/registry.js';
 import { isAllowed } from './auth/allowlist.js';
 import { checkBudget, recordSpend } from './auth/budget.js';
-import { modelKeyboard, sessionsKeyboard } from './ui/keyboards.js';
+import { modelKeyboard, sessionsKeyboard, variantKeyboard } from './ui/keyboards.js';
 
 export type AppContext = StreamFlavor<Context>;
 
@@ -67,9 +67,11 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
   bot.command('model', async (ctx) => {
     const ids = deps.providers.ids();
     const state = await getOrInitState(deps.repo, ctx.from!.id, ids[0]!);
+    const current = state.modelByProvider[state.activeProvider]
+      ?? deps.providers.get(state.activeProvider).defaultModel;
     await ctx.reply(
-      `Current model: *${PROVIDER_LABELS[state.activeProvider]}*\nPick a model:`,
-      { parse_mode: 'Markdown', reply_markup: modelKeyboard(ids) },
+      `Active: *${PROVIDER_LABELS[state.activeProvider]} · ${current}*\nTap a row to switch provider, or ⚙ to pick a variant:`,
+      { parse_mode: 'Markdown', reply_markup: modelKeyboard(ids, state, deps.providers) },
     );
   });
 
@@ -83,9 +85,51 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
     state.activeProvider = provider;
     state.updatedAt = Date.now();
     await deps.repo.putState(state);
+    const current = state.modelByProvider[provider] ?? deps.providers.get(provider).defaultModel;
     await ctx.answerCallbackQuery({ text: `Switched to ${PROVIDER_LABELS[provider]}` });
     await ctx.editMessageText(
-      `Active model: *${PROVIDER_LABELS[provider]}*`,
+      `Active: *${PROVIDER_LABELS[provider]} · ${current}*`,
+      { parse_mode: 'Markdown' },
+    );
+  });
+
+  // Open the variant picker for a specific provider.
+  bot.callbackQuery(/^pickmodel:(openai|anthropic|gemini)$/, async (ctx) => {
+    const provider = ctx.match![1] as ProviderId;
+    if (!deps.providers.has(provider)) {
+      await ctx.answerCallbackQuery({ text: 'Provider not configured' });
+      return;
+    }
+    const impl = deps.providers.get(provider);
+    const state = await getOrInitState(deps.repo, ctx.from!.id, provider);
+    const current = state.modelByProvider[provider] ?? impl.defaultModel;
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText(
+      `Pick a *${PROVIDER_LABELS[provider]}* variant:`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: variantKeyboard(provider, current, impl.selectableModels),
+      },
+    );
+  });
+
+  // Set the user's preferred variant for a provider; also activates that provider.
+  bot.callbackQuery(/^variant:(openai|anthropic|gemini):(.+)$/, async (ctx) => {
+    const provider = ctx.match![1] as ProviderId;
+    const modelId = ctx.match![2]!;
+    const impl = deps.providers.get(provider);
+    if (!impl.selectableModels.some((m) => m.id === modelId)) {
+      await ctx.answerCallbackQuery({ text: 'Unknown model' });
+      return;
+    }
+    const state = await getOrInitState(deps.repo, ctx.from!.id, provider);
+    state.activeProvider = provider;
+    state.modelByProvider[provider] = modelId;
+    state.updatedAt = Date.now();
+    await deps.repo.putState(state);
+    await ctx.answerCallbackQuery({ text: `Set to ${modelId}` });
+    await ctx.editMessageText(
+      `Active: *${PROVIDER_LABELS[provider]} · ${modelId}*\n_New sessions will use this. Use /new to start one._`,
       { parse_mode: 'Markdown' },
     );
   });
@@ -94,11 +138,18 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
   bot.command('new', async (ctx) => {
     const state = await getOrInitState(deps.repo, ctx.from!.id, deps.providers.ids()[0]!);
     const provider = state.activeProvider;
-    const session = await createBlankSession(deps, ctx.from!.id, provider);
+    const session = await createBlankSession(
+      deps,
+      ctx.from!.id,
+      provider,
+      state.modelByProvider[provider],
+    );
     state.activeSessionByProvider[provider] = session.sessionId;
     state.updatedAt = Date.now();
     await deps.repo.putState(state);
-    await ctx.reply(`Started a new ${PROVIDER_LABELS[provider]} session.`);
+    await ctx.reply(`Started a new ${PROVIDER_LABELS[provider]} session on \`${session.model}\`.`, {
+      parse_mode: 'Markdown',
+    });
   });
 
   // ── /sessions ───────────────────────────────────────────────────────────
@@ -209,7 +260,7 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
     if (existing) {
       session = existing;
     } else {
-      session = await createBlankSession(deps, userId, provider);
+      session = await createBlankSession(deps, userId, provider, state.modelByProvider[provider]);
       state.activeSessionByProvider[provider] = session.sessionId;
       await deps.repo.putState({ ...state, updatedAt: Date.now() });
     }
@@ -325,24 +376,41 @@ async function getOrInitState(
   defaultProvider: ProviderId,
 ): Promise<UserState> {
   const existing = await repo.getState(userId);
-  if (existing) return existing;
+  if (existing) {
+    // Backfill: older state items predate modelByProvider.
+    if (!existing.modelByProvider) existing.modelByProvider = {};
+    return existing;
+  }
   const fresh: UserState = {
     userId,
     activeProvider: defaultProvider,
     activeSessionByProvider: {},
+    modelByProvider: {},
     updatedAt: Date.now(),
   };
   await repo.putState(fresh);
   return fresh;
 }
 
-async function createBlankSession(deps: BotDeps, userId: number, provider: ProviderId): Promise<Session> {
+async function createBlankSession(
+  deps: BotDeps,
+  userId: number,
+  provider: ProviderId,
+  preferredModel?: string,
+): Promise<Session> {
   const now = Date.now();
+  const impl = deps.providers.get(provider);
+  // If the preferred model is no longer in the curated list (model removed
+  // from selectableModels in a deploy), fall back to the provider default.
+  const validPreferred =
+    preferredModel && impl.selectableModels.some((m) => m.id === preferredModel)
+      ? preferredModel
+      : null;
   const s: Session = {
     userId,
     sessionId: randomUUID(),
     provider,
-    model: deps.providers.get(provider).defaultModel,
+    model: validPreferred ?? impl.defaultModel,
     title: '',
     createdAt: now,
     lastUsedAt: now,

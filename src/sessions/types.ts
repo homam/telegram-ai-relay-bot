@@ -25,6 +25,8 @@ export interface UserState {
   userId: number;
   activeProvider: ProviderId;
   activeSessionByProvider: Partial<Record<ProviderId, string>>;
+  /** User's preferred model per provider; falls back to provider's defaultModel. */
+  modelByProvider: Partial<Record<ProviderId, string>>;
   updatedAt: number;
 }
 
