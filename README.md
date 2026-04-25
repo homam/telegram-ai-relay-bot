@@ -209,6 +209,13 @@ aws logs tail /aws/lambda/$(aws lambda list-functions --region eu-central-1 --qu
 Then re-run `npm run set-webhook -- <url>` to flush the queue (the script
 passes `drop_pending_updates: true`).
 
+## Roadmap
+
+Features considered or designed but not yet built — see [ROADMAP.md](ROADMAP.md).
+Includes the trade-offs discussed for organic in-chat image generation,
+`/imagine`, `/system` prompts, `/regenerate`, `/search`, `/export`,
+auto-summarization, and per-provider sub-budgets.
+
 ## License
 
 MIT (or whatever the owner picks).
