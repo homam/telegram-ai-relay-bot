@@ -29,6 +29,23 @@ export interface SelectableModel {
   label: string;
 }
 
+export interface ImageInput {
+  /** MIME type, e.g. `image/jpeg` or `image/png`. */
+  mimeType: string;
+  /** Raw base64-encoded image bytes (no `data:` prefix). */
+  base64: string;
+}
+
+/**
+ * What the user just said, plus any attachments on this turn. Images are
+ * turn-local — they're sent to the provider for this turn only and are not
+ * persisted in session history.
+ */
+export interface UserInput {
+  text: string;
+  images?: ImageInput[];
+}
+
 export interface AIProvider {
   id: ProviderId;
   defaultModel: string;
@@ -38,9 +55,9 @@ export interface AIProvider {
    * Send conversation history (already-trimmed) plus the latest user message.
    * Returns assistant text and token usage.
    */
-  send(history: ChatMessage[], userMessage: string, model?: string): Promise<ProviderReply>;
+  send(history: ChatMessage[], userInput: UserInput, model?: string): Promise<ProviderReply>;
   /**
    * Stream a response. Yields token-delta strings and returns final usage.
    */
-  streamSend(history: ChatMessage[], userMessage: string, model?: string): ProviderStream;
+  streamSend(history: ChatMessage[], userInput: UserInput, model?: string): ProviderStream;
 }

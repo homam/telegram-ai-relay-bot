@@ -1,6 +1,31 @@
 import OpenAI from 'openai';
 import type { ChatMessage } from '../sessions/types.js';
-import type { AIProvider, ProviderReply, ProviderStream, SelectableModel } from './types.js';
+import type {
+  AIProvider,
+  ProviderReply,
+  ProviderStream,
+  SelectableModel,
+  UserInput,
+} from './types.js';
+
+type UserContent =
+  | string
+  | Array<
+      | { type: 'text'; text: string }
+      | { type: 'image_url'; image_url: { url: string } }
+    >;
+
+function buildUserContent(input: UserInput): UserContent {
+  if (!input.images?.length) return input.text;
+  const parts: Exclude<UserContent, string> = [{ type: 'text', text: input.text }];
+  for (const img of input.images) {
+    parts.push({
+      type: 'image_url',
+      image_url: { url: `data:${img.mimeType};base64,${img.base64}` },
+    });
+  }
+  return parts;
+}
 
 export class OpenAIProvider implements AIProvider {
   readonly id = 'openai' as const;
@@ -19,15 +44,16 @@ export class OpenAIProvider implements AIProvider {
     this.defaultModel = defaultModel;
   }
 
-  async send(history: ChatMessage[], userMessage: string, model?: string): Promise<ProviderReply> {
+  async send(history: ChatMessage[], userInput: UserInput, model?: string): Promise<ProviderReply> {
     const resolved = model ?? this.defaultModel;
     const messages = [
       ...history.map((m) => ({ role: m.role, content: m.content })),
-      { role: 'user' as const, content: userMessage },
+      { role: 'user' as const, content: buildUserContent(userInput) },
     ];
     const r = await this.client.chat.completions.create({
       model: resolved,
-      messages,
+      // The OpenAI SDK accepts either string or content-array for `content`.
+      messages: messages as never,
     });
     const text = r.choices[0]?.message?.content ?? '';
     return {
@@ -40,15 +66,15 @@ export class OpenAIProvider implements AIProvider {
     };
   }
 
-  async *streamSend(history: ChatMessage[], userMessage: string, model?: string): ProviderStream {
+  async *streamSend(history: ChatMessage[], userInput: UserInput, model?: string): ProviderStream {
     const resolved = model ?? this.defaultModel;
     const messages = [
       ...history.map((m) => ({ role: m.role, content: m.content })),
-      { role: 'user' as const, content: userMessage },
+      { role: 'user' as const, content: buildUserContent(userInput) },
     ];
     const stream = await this.client.chat.completions.create({
       model: resolved,
-      messages,
+      messages: messages as never,
       stream: true,
       stream_options: { include_usage: true },
     });

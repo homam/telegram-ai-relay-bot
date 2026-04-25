@@ -1,6 +1,24 @@
 import { GoogleGenAI } from '@google/genai';
 import type { ChatMessage } from '../sessions/types.js';
-import type { AIProvider, ProviderReply, ProviderStream, SelectableModel } from './types.js';
+import type {
+  AIProvider,
+  ProviderReply,
+  ProviderStream,
+  SelectableModel,
+  UserInput,
+} from './types.js';
+
+type GeminiPart = { text: string } | { inlineData: { mimeType: string; data: string } };
+type GeminiContent = { role: 'user' | 'model'; parts: GeminiPart[] };
+
+function buildUserParts(input: UserInput): GeminiPart[] {
+  const parts: GeminiPart[] = [];
+  for (const img of input.images ?? []) {
+    parts.push({ inlineData: { mimeType: img.mimeType, data: img.base64 } });
+  }
+  parts.push({ text: input.text });
+  return parts;
+}
 
 export class GeminiProvider implements AIProvider {
   readonly id = 'gemini' as const;
@@ -16,13 +34,11 @@ export class GeminiProvider implements AIProvider {
     this.defaultModel = defaultModel;
   }
 
-  async send(history: ChatMessage[], userMessage: string, model?: string): Promise<ProviderReply> {
-    const resolved = model ?? this.defaultModel;
-
-    // Gemini uses 'user' / 'model' roles. Map system messages to a system instruction,
-    // and assistant -> model.
+  private prepare(history: ChatMessage[], userInput: UserInput) {
+    // Gemini uses 'user' / 'model' roles. Map system messages to a system
+    // instruction, and assistant -> model.
     const systemParts: string[] = [];
-    const contents: { role: 'user' | 'model'; parts: { text: string }[] }[] = [];
+    const contents: GeminiContent[] = [];
     for (const m of history) {
       if (m.role === 'system') {
         systemParts.push(m.content);
@@ -33,12 +49,21 @@ export class GeminiProvider implements AIProvider {
         });
       }
     }
-    contents.push({ role: 'user', parts: [{ text: userMessage }] });
+    contents.push({ role: 'user', parts: buildUserParts(userInput) });
+    return {
+      contents,
+      config: systemParts.length ? { systemInstruction: systemParts.join('\n\n') } : undefined,
+    };
+  }
+
+  async send(history: ChatMessage[], userInput: UserInput, model?: string): Promise<ProviderReply> {
+    const resolved = model ?? this.defaultModel;
+    const { contents, config } = this.prepare(history, userInput);
 
     const r = await this.client.models.generateContent({
       model: resolved,
       contents,
-      config: systemParts.length ? { systemInstruction: systemParts.join('\n\n') } : undefined,
+      config,
     });
 
     const text = r.text ?? '';
@@ -54,27 +79,14 @@ export class GeminiProvider implements AIProvider {
     };
   }
 
-  async *streamSend(history: ChatMessage[], userMessage: string, model?: string): ProviderStream {
+  async *streamSend(history: ChatMessage[], userInput: UserInput, model?: string): ProviderStream {
     const resolved = model ?? this.defaultModel;
-
-    const systemParts: string[] = [];
-    const contents: { role: 'user' | 'model'; parts: { text: string }[] }[] = [];
-    for (const m of history) {
-      if (m.role === 'system') {
-        systemParts.push(m.content);
-      } else {
-        contents.push({
-          role: m.role === 'assistant' ? 'model' : 'user',
-          parts: [{ text: m.content }],
-        });
-      }
-    }
-    contents.push({ role: 'user', parts: [{ text: userMessage }] });
+    const { contents, config } = this.prepare(history, userInput);
 
     const stream = await this.client.models.generateContentStream({
       model: resolved,
       contents,
-      config: systemParts.length ? { systemInstruction: systemParts.join('\n\n') } : undefined,
+      config,
     });
 
     let inputTokens = 0;

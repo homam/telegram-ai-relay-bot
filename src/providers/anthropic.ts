@@ -1,6 +1,31 @@
 import Anthropic from '@anthropic-ai/sdk';
 import type { ChatMessage } from '../sessions/types.js';
-import type { AIProvider, ProviderReply, ProviderStream, SelectableModel } from './types.js';
+import type {
+  AIProvider,
+  ProviderReply,
+  ProviderStream,
+  SelectableModel,
+  UserInput,
+} from './types.js';
+
+type AnthropicMessage = { role: 'user' | 'assistant'; content: string | Anthropic.ContentBlockParam[] };
+
+function buildUserContent(input: UserInput): string | Anthropic.ContentBlockParam[] {
+  if (!input.images?.length) return input.text;
+  const parts: Anthropic.ContentBlockParam[] = [];
+  for (const img of input.images) {
+    parts.push({
+      type: 'image',
+      source: {
+        type: 'base64',
+        media_type: img.mimeType as Anthropic.Base64ImageSource['media_type'],
+        data: img.base64,
+      },
+    });
+  }
+  parts.push({ type: 'text', text: input.text });
+  return parts;
+}
 
 export class AnthropicProvider implements AIProvider {
   readonly id = 'anthropic' as const;
@@ -17,22 +42,28 @@ export class AnthropicProvider implements AIProvider {
     this.defaultModel = defaultModel;
   }
 
-  async send(history: ChatMessage[], userMessage: string, model?: string): Promise<ProviderReply> {
-    const resolved = model ?? this.defaultModel;
-
-    // Anthropic separates system prompt from messages and only allows user/assistant roles.
+  private prepare(history: ChatMessage[], userInput: UserInput) {
     const systemParts: string[] = [];
-    const messages: { role: 'user' | 'assistant'; content: string }[] = [];
+    const messages: AnthropicMessage[] = [];
     for (const m of history) {
       if (m.role === 'system') systemParts.push(m.content);
       else messages.push({ role: m.role, content: m.content });
     }
-    messages.push({ role: 'user', content: userMessage });
+    messages.push({ role: 'user', content: buildUserContent(userInput) });
+    return {
+      system: systemParts.length ? systemParts.join('\n\n') : undefined,
+      messages,
+    };
+  }
+
+  async send(history: ChatMessage[], userInput: UserInput, model?: string): Promise<ProviderReply> {
+    const resolved = model ?? this.defaultModel;
+    const { system, messages } = this.prepare(history, userInput);
 
     const r = await this.client.messages.create({
       model: resolved,
       max_tokens: 4096,
-      system: systemParts.length ? systemParts.join('\n\n') : undefined,
+      system,
       messages,
     });
 
@@ -51,21 +82,14 @@ export class AnthropicProvider implements AIProvider {
     };
   }
 
-  async *streamSend(history: ChatMessage[], userMessage: string, model?: string): ProviderStream {
+  async *streamSend(history: ChatMessage[], userInput: UserInput, model?: string): ProviderStream {
     const resolved = model ?? this.defaultModel;
-
-    const systemParts: string[] = [];
-    const messages: { role: 'user' | 'assistant'; content: string }[] = [];
-    for (const m of history) {
-      if (m.role === 'system') systemParts.push(m.content);
-      else messages.push({ role: m.role, content: m.content });
-    }
-    messages.push({ role: 'user', content: userMessage });
+    const { system, messages } = this.prepare(history, userInput);
 
     const stream = this.client.messages.stream({
       model: resolved,
       max_tokens: 4096,
-      system: systemParts.length ? systemParts.join('\n\n') : undefined,
+      system,
       messages,
     });
 

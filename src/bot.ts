@@ -13,6 +13,7 @@ import type {
 } from './sessions/types.js';
 import type { ProviderRegistry } from './providers/registry.js';
 import { PROVIDER_LABELS } from './providers/registry.js';
+import type { UserInput } from './providers/types.js';
 import { isAllowed } from './auth/allowlist.js';
 import { checkBudget, recordSpend } from './auth/budget.js';
 import { modelKeyboard, sessionsKeyboard, variantKeyboard } from './ui/keyboards.js';
@@ -233,11 +234,13 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
     );
   });
 
-  // ── plain text → stream relay to active provider ────────────────────────
-  bot.on('message:text', async (ctx) => {
-    const text = ctx.message.text;
-    if (text.startsWith('/')) return; // unknown commands fall through
-
+  // ── shared relay pipeline (used by text + photo + document handlers) ────
+  async function relayToActiveSession(
+    ctx: AppContext,
+    userInput: UserInput,
+    /** Text used for the stored history entry — typically userInput.text or "[image]". */
+    historyContent: string,
+  ): Promise<void> {
     const userId = ctx.from!.id;
 
     // Budget gate
@@ -265,9 +268,9 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
       await deps.repo.putState({ ...state, updatedAt: Date.now() });
     }
 
-    // Auto-title from first message
+    // Auto-title from first turn
     if (!session.title && session.messages.length === 0) {
-      session.title = text.slice(0, 40);
+      session.title = (userInput.text || historyContent).slice(0, 40) || 'New session';
     }
 
     // Trim history sent to provider (keep full history in storage)
@@ -276,7 +279,7 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
     // Run the provider stream and tee the chunks: pass to Telegram, accumulate locally.
     const gen = providerImpl.streamSend(
       trimmed,
-      text,
+      userInput,
       session.model || providerImpl.defaultModel,
     );
     const meta: { assembled: string; final: { usage: { input: number; output: number }; model: string } | null } = {
@@ -336,9 +339,9 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
       }
     }
 
-    // Persist turn
+    // Persist turn — image bytes are NOT stored; only the text/marker.
     const now = Date.now();
-    const userMsg: ChatMessage = { role: 'user', content: text, ts: now };
+    const userMsg: ChatMessage = { role: 'user', content: historyContent, ts: now };
     const asstMsg: ChatMessage = {
       role: 'assistant',
       content: assembled || '(empty reply)',
@@ -359,7 +362,79 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
       final.usage.input,
       final.usage.output,
     );
+  }
+
+  // ── plain text ──────────────────────────────────────────────────────────
+  bot.on('message:text', async (ctx) => {
+    const text = ctx.message.text;
+    if (text.startsWith('/')) return; // unknown commands fall through
+    await relayToActiveSession(ctx, { text }, text);
   });
+
+  // ── photos (compressed images sent as messages) ─────────────────────────
+  bot.on('message:photo', async (ctx) => {
+    const photos = ctx.message.photo;
+    // Telegram delivers an array of sizes from smallest to largest.
+    // Pick the largest that's still under our hard ceiling for inline base64.
+    const largest = photos[photos.length - 1];
+    if (!largest) return;
+    const caption = ctx.message.caption ?? '';
+    await handleImageMessage(
+      ctx,
+      largest.file_id,
+      'image/jpeg', // Telegram re-encodes photos to JPEG
+      caption,
+    );
+  });
+
+  // ── documents — only image/* mime types; other documents fall through ───
+  bot.on('message:document', async (ctx) => {
+    const doc = ctx.message.document;
+    const mime = doc.mime_type ?? '';
+    if (!mime.startsWith('image/')) {
+      await ctx.reply('Sorry, only image attachments are supported. Send a JPEG/PNG/WEBP photo or image document.');
+      return;
+    }
+    const caption = ctx.message.caption ?? '';
+    await handleImageMessage(ctx, doc.file_id, mime, caption);
+  });
+
+  // ── stickers / animations: polite refusal ───────────────────────────────
+  bot.on(['message:sticker', 'message:animation'], async (ctx) => {
+    await ctx.reply("Stickers and GIFs aren't supported yet — try a regular photo.");
+  });
+
+  // ── shared image-relay path ─────────────────────────────────────────────
+  async function handleImageMessage(
+    ctx: AppContext,
+    fileId: string,
+    mimeType: string,
+    caption: string,
+  ): Promise<void> {
+    let base64: string;
+    try {
+      const file = await ctx.api.getFile(fileId);
+      const filePath = file.file_path;
+      if (!filePath) throw new Error('Telegram getFile returned no file_path');
+      const fileUrl = `https://api.telegram.org/file/bot${deps.token}/${filePath}`;
+      const res = await fetch(fileUrl, { signal: AbortSignal.timeout(20000) });
+      if (!res.ok) throw new Error(`Telegram file fetch ${res.status}`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      base64 = buf.toString('base64');
+    } catch (err) {
+      console.error('image download failed', err);
+      await ctx.reply(`Couldn't download the image: ${(err as Error).message}`);
+      return;
+    }
+
+    const text = caption.trim() || 'Describe this image in detail.';
+    const userInput: UserInput = {
+      text,
+      images: [{ mimeType, base64 }],
+    };
+    const historyContent = caption.trim() ? `[image] ${caption.trim()}` : '[image]';
+    await relayToActiveSession(ctx, userInput, historyContent);
+  }
 
   bot.catch((err) => {
     console.error('bot error', err);
