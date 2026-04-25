@@ -90,4 +90,45 @@ export class OpenAIProvider implements AIProvider {
     }
     return { model: resolved, usage: { input: inputTokens, output: outputTokens } };
   }
+
+  /**
+   * Whisper STT. Note: this lives on OpenAIProvider only (not the AIProvider
+   * interface) because Whisper is OpenAI-specific. The bot calls it directly
+   * regardless of the user's active chat provider.
+   */
+  async transcribe(
+    audio: Buffer,
+    mimeType: string,
+    fileName: string,
+  ): Promise<{ text: string; durationSec: number }> {
+    const file = await OpenAI.toFile(audio, fileName, { type: mimeType });
+    const r = await this.client.audio.transcriptions.create({
+      model: 'whisper-1',
+      file,
+      response_format: 'verbose_json',
+    });
+    return {
+      text: r.text,
+      durationSec: (r as { duration?: number }).duration ?? 0,
+    };
+  }
+
+  /**
+   * TTS. Returns OPUS-encoded audio (Telegram expects this format for voice
+   * notes). Truncates to 4096 chars — OpenAI's hard limit per request.
+   */
+  async textToSpeech(
+    text: string,
+    voice: 'alloy' | 'echo' | 'fable' | 'onyx' | 'nova' | 'shimmer' | 'coral' = 'alloy',
+  ): Promise<{ audio: Buffer; chars: number; truncated: boolean }> {
+    const truncated = text.length > 4096;
+    const input = truncated ? text.slice(0, 4096) : text;
+    const r = await this.client.audio.speech.create({
+      model: 'gpt-4o-mini-tts',
+      voice,
+      input,
+      response_format: 'opus',
+    });
+    return { audio: Buffer.from(await r.arrayBuffer()), chars: input.length, truncated };
+  }
 }

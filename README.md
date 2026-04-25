@@ -9,13 +9,26 @@ a daily spend cap. Runs entirely on AWS Lambda.
 - **Native streaming** — responses appear ChatGPT-style as the LLM types,
   using Telegram's `sendMessageDraft` (Bot API 9.5+).
 - **Three providers, one bot** — `/model` switches between OpenAI, Claude,
-  and Gemini on the fly.
+  and Gemini on the fly. The ⚙ button on each provider opens a variant
+  picker (e.g. GPT-5.4 / 5.4-mini / 5.4-nano / 5.4-pro).
+- **Photo input** — send any photo (or a JPEG/PNG attached as a document)
+  and the active model analyzes it. Use the caption to ask a specific
+  question.
+- **Voice input** — voice notes and audio files are transcribed with
+  OpenAI Whisper, the transcription is echoed back so you can verify, then
+  passed to the active chat model.
+- **Voice output** — `/say` reads the latest reply aloud as a Telegram
+  voice note (OpenAI TTS, default voice "alloy"). Reply to any message
+  with `/say` to hear that specific one.
+- **`/cancel`** — interrupt a long streaming response mid-flight and keep
+  what was already generated.
 - **Per-provider sessions** — `/sessions` lists your past conversations for
   the active model and lets you resume any of them.
 - **Markdown rendering** — headings, bold, lists, fenced code blocks all
   render properly; conversion handled automatically.
 - **Allowlist + daily USD cap** — only configured Telegram user IDs can
-  use the bot, and each user has a per-day spend limit.
+  use the bot, and each user has a per-day spend limit (chat tokens +
+  Whisper minutes counted in the same budget).
 
 ## Architecture
 
@@ -124,13 +137,17 @@ stale queue.
 | Command | Behavior |
 |---|---|
 | `/start`, `/help` | Show help text |
-| `/model` | Pick OpenAI / Claude / Gemini (inline keyboard) |
+| `/model` | Pick a provider; tap ⚙ to choose the model variant within it |
 | `/new` | Start a fresh session in the current model |
 | `/sessions` | List + resume previous sessions for the current model |
 | `/rename <title>` | Rename the active session |
 | `/forget` | Delete the active session |
+| `/cancel` | Stop the response currently streaming (keeps what was generated) |
+| `/say` | Read the latest reply aloud as a voice note. Reply to any message with `/say` to hear that one |
 | `/usage` | Today's tokens + estimated USD spend vs. cap |
 | any text | Send to the active session — relayed to the AI |
+| a photo or image document | Active model analyzes the image (caption is the prompt; falls back to "describe it" if absent) |
+| a voice note or audio file | Whisper transcribes it; the text is sent to the active model |
 
 ## Configuration
 

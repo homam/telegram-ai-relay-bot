@@ -21,6 +21,7 @@ const sessionSk = (provider: ProviderId, sessionId: string) =>
   `SESSION#${provider}#${sessionId}`;
 const sessionPrefix = (provider: ProviderId) => `SESSION#${provider}#`;
 const budgetSk = (date: string) => `BUDGET#${date}`;
+const cancelSk = () => 'CANCEL';
 
 const BUDGET_TTL_DAYS = 40;
 
@@ -170,6 +171,31 @@ export class DynamoSessionsRepo implements SessionsRepo {
       tokensOut: (a.tokensOut as number) ?? 0,
       usdEstimate: (a.usdEstimate as number) ?? 0,
     };
+  }
+
+  async setCancelFlag(userId: number, ttlSec = 60): Promise<void> {
+    const expiresAt = Math.floor(Date.now() / 1000) + ttlSec;
+    await this.doc.send(
+      new PutCommand({
+        TableName: this.table,
+        Item: { pk: userPk(userId), sk: cancelSk(), expiresAt },
+      }),
+    );
+  }
+  async getCancelFlag(userId: number): Promise<boolean> {
+    const r = await this.doc.send(
+      new GetCommand({ TableName: this.table, Key: { pk: userPk(userId), sk: cancelSk() } }),
+    );
+    if (!r.Item) return false;
+    // DDB TTL deletion is "eventually" within 48h, so we double-check ourselves.
+    const exp = r.Item.expiresAt as number | undefined;
+    if (exp && exp * 1000 < Date.now()) return false;
+    return true;
+  }
+  async clearCancelFlag(userId: number): Promise<void> {
+    await this.doc.send(
+      new DeleteCommand({ TableName: this.table, Key: { pk: userPk(userId), sk: cancelSk() } }),
+    );
   }
 
   private toItem(s: Session) {

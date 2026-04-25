@@ -15,7 +15,8 @@ import type { ProviderRegistry } from './providers/registry.js';
 import { PROVIDER_LABELS } from './providers/registry.js';
 import type { UserInput } from './providers/types.js';
 import { isAllowed } from './auth/allowlist.js';
-import { checkBudget, recordSpend } from './auth/budget.js';
+import { checkBudget, recordAudioSpend, recordSpend, recordTtsSpend } from './auth/budget.js';
+import { OpenAIProvider } from './providers/openai.js';
 import { modelKeyboard, sessionsKeyboard, variantKeyboard } from './ui/keyboards.js';
 
 export type AppContext = StreamFlavor<Context>;
@@ -33,6 +34,14 @@ export interface BotDeps {
 const MAX_HISTORY_TURNS = 40;
 const MAX_TG_MESSAGE_LEN = 4000;
 const SESSION_LIST_LIMIT = 10;
+const CANCEL_POLL_MS = 500;
+
+class CancelError extends Error {
+  constructor() {
+    super('cancelled');
+    this.name = 'CancelError';
+  }
+}
 
 export function createBot(deps: BotDeps): Bot<AppContext> {
   // grammY ships node-fetch v2 which rejects Node 20's native AbortSignal —
@@ -234,6 +243,102 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
     );
   });
 
+  // ── /cancel — interrupt an in-flight stream ─────────────────────────────
+  bot.command('cancel', async (ctx) => {
+    await deps.repo.setCancelFlag(ctx.from!.id);
+    await ctx.reply('🛑 Stopping…');
+  });
+
+  // ── /say — read the active session's latest reply (or a replied-to message) aloud
+  bot.command('say', async (ctx) => {
+    const userId = ctx.from!.id;
+
+    // Budget gate
+    const budget = await checkBudget(deps.repo, userId, deps.dailyUsdCapPerUser);
+    if (!budget.allowed) {
+      await ctx.reply(
+        `Daily cap reached: $${budget.usedUsd.toFixed(4)} / $${budget.capUsd.toFixed(2)}.`,
+      );
+      return;
+    }
+
+    if (!deps.providers.has('openai')) {
+      await ctx.reply('Voice replies need OpenAI configured. Add `OPENAI_API_KEY` to SSM.');
+      return;
+    }
+    const openai = deps.providers.get('openai') as OpenAIProvider;
+
+    // Resolve the text to speak:
+    // 1. If /say replies to a specific message that has text, use that.
+    // 2. Otherwise read the latest assistant message of the active session.
+    let text: string | null = null;
+    const replied = ctx.message?.reply_to_message;
+    if (replied && 'text' in replied && typeof replied.text === 'string' && replied.text.trim()) {
+      text = replied.text;
+    } else {
+      const state = await deps.repo.getState(userId);
+      const activeSessionId = state?.activeSessionByProvider[state.activeProvider];
+      if (activeSessionId) {
+        const session = await deps.repo.getSession(userId, activeSessionId);
+        for (let i = (session?.messages.length ?? 0) - 1; i >= 0; i--) {
+          const m = session!.messages[i]!;
+          if (m.role === 'assistant' && m.content.trim() && m.content !== '(empty reply)') {
+            text = m.content;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!text) {
+      await ctx.reply(
+        'Nothing to read — reply to a message with /say, or send a message first.',
+      );
+      return;
+    }
+
+    let result;
+    try {
+      console.log(`[say] starting TTS for ${text.length} chars`);
+      const t0 = Date.now();
+      result = await openai.textToSpeech(text, 'alloy');
+      console.log(`[say] TTS ok (${Date.now() - t0}ms, ${result.audio.length} bytes)`);
+    } catch (err) {
+      console.error('tts failed', err);
+      await ctx.reply(`Voice generation failed: ${(err as Error).message}`);
+      return;
+    }
+
+    await recordTtsSpend(deps.repo, userId, result.chars);
+
+    try {
+      console.log(`[say] sending voice (${result.audio.length} bytes)…`);
+      const t0 = Date.now();
+      // Bypass grammY's InputFile upload — under Lambda it hangs on multipart
+      // streaming. Native fetch + FormData + Blob delivers reliably.
+      const fd = new FormData();
+      fd.set('chat_id', String(ctx.chat!.id));
+      fd.set(
+        'voice',
+        new Blob([new Uint8Array(result.audio)], { type: 'audio/ogg' }),
+        'reply.ogg',
+      );
+      fd.set('reply_parameters', JSON.stringify({ message_id: ctx.message!.message_id }));
+      if (result.truncated) fd.set('caption', '(audio truncated to 4096 chars)');
+      const res = await fetch(`https://api.telegram.org/bot${deps.token}/sendVoice`, {
+        method: 'POST',
+        body: fd,
+        signal: AbortSignal.timeout(60_000),
+      });
+      const json = (await res.json()) as { ok: boolean; description?: string };
+      if (!json.ok) throw new Error(json.description ?? `Telegram ${res.status}`);
+      console.log(`[say] voice sent (${Date.now() - t0}ms)`);
+    } catch (err) {
+      console.error('sendVoice failed', err);
+      await ctx.reply(`Couldn't deliver the voice note: ${(err as Error).message}`);
+    }
+  });
+
   // ── shared relay pipeline (used by text + photo + document handlers) ────
   async function relayToActiveSession(
     ctx: AppContext,
@@ -282,17 +387,30 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
       userInput,
       session.model || providerImpl.defaultModel,
     );
-    const meta: { assembled: string; final: { usage: { input: number; output: number }; model: string } | null } = {
-      assembled: '',
-      final: null,
-    };
+    const meta: {
+      assembled: string;
+      final: { usage: { input: number; output: number }; model: string } | null;
+      cancelled: boolean;
+    } = { assembled: '', final: null, cancelled: false };
 
+    // Clear any stale cancel flag from a previous interaction before starting.
+    await deps.repo.clearCancelFlag(userId);
+
+    let lastCancelCheck = 0;
     async function* relay(): AsyncGenerator<string> {
       while (true) {
         const r = await gen.next();
         if (r.done) {
           meta.final = r.value;
           return;
+        }
+        const now = Date.now();
+        if (now - lastCancelCheck > CANCEL_POLL_MS) {
+          lastCancelCheck = now;
+          if (await deps.repo.getCancelFlag(userId)) {
+            await deps.repo.clearCancelFlag(userId);
+            throw new CancelError();
+          }
         }
         if (r.value) {
           meta.assembled += r.value;
@@ -305,17 +423,30 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
     try {
       sentMessages = await ctx.replyWithStream(relay());
     } catch (err) {
-      console.error('stream error', err);
-      await ctx.reply(`Provider error: ${(err as Error).message}`);
-      return;
+      if (err instanceof CancelError) {
+        meta.cancelled = true;
+        // Fall through to the persist + format-edit path so the partial
+        // reply is saved and shown with a "(cancelled)" suffix.
+      } else {
+        console.error('stream error', err);
+        await ctx.reply(`Provider error: ${(err as Error).message}`);
+        return;
+      }
     }
 
-    if (!meta.final) {
+    if (!meta.final && !meta.cancelled) {
       console.warn('stream ended without final usage');
       return;
     }
-    const final = meta.final;
+    // On cancel, we won't have provider-reported usage; estimate as 0
+    // (we still record the partial output so cost is non-zero via output tokens
+    // we approximate from char count below).
     const assembled = meta.assembled;
+    const final = meta.final ?? {
+      model: session.model || providerImpl.defaultModel,
+      // Rough fallback: Approximate tokens from character count for the cancelled portion.
+      usage: { input: 0, output: Math.ceil(assembled.length / 4) },
+    };
 
     // After streaming finishes, reformat the committed message(s) with
     // Telegram's MarkdownV2 dialect so headings, bold/italic, lists, and code
@@ -334,17 +465,30 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
           });
         }
       } catch (err) {
-        // Telegram rejected the formatted version — leave the plain text in place.
         console.warn('post-stream MarkdownV2 reformat failed, keeping plain text:', err);
       }
+    }
+
+    // Cancel UX: regardless of how far the stream got, surface a clear
+    // marker. If no draft was committed, also resend the partial so it
+    // isn't lost when the transient draft animation disappears.
+    if (meta.cancelled) {
+      if (sentMessages.length === 0 && assembled.trim()) {
+        // No commit happened — resend the partial as a real message.
+        await ctx.reply(assembled.slice(0, 4000));
+      }
+      await ctx.reply(assembled.trim() ? '🛑 _(cancelled)_' : '🛑 Cancelled before a reply was started.');
     }
 
     // Persist turn — image bytes are NOT stored; only the text/marker.
     const now = Date.now();
     const userMsg: ChatMessage = { role: 'user', content: historyContent, ts: now };
+    const asstContent = meta.cancelled
+      ? `${assembled || ''}${assembled ? '\n' : ''}[cancelled]`
+      : assembled || '(empty reply)';
     const asstMsg: ChatMessage = {
       role: 'assistant',
-      content: assembled || '(empty reply)',
+      content: asstContent,
       ts: Date.now(),
     };
     session.messages.push(userMsg, asstMsg);
@@ -403,6 +547,93 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
   bot.on(['message:sticker', 'message:animation'], async (ctx) => {
     await ctx.reply("Stickers and GIFs aren't supported yet — try a regular photo.");
   });
+
+  // ── voice notes ─────────────────────────────────────────────────────────
+  bot.on('message:voice', async (ctx) => {
+    const v = ctx.message.voice;
+    await handleVoice(ctx, v.file_id, v.mime_type ?? 'audio/ogg', 'voice.ogg');
+  });
+
+  // ── audio files ─────────────────────────────────────────────────────────
+  bot.on('message:audio', async (ctx) => {
+    const a = ctx.message.audio;
+    await handleVoice(
+      ctx,
+      a.file_id,
+      a.mime_type ?? 'audio/mpeg',
+      a.file_name ?? 'audio.mp3',
+    );
+  });
+
+  async function handleVoice(
+    ctx: AppContext,
+    fileId: string,
+    mimeType: string,
+    fileName: string,
+  ): Promise<void> {
+    const userId = ctx.from!.id;
+
+    // Allowlist already gated globally; budget gate here for fast failure.
+    const budget = await checkBudget(deps.repo, userId, deps.dailyUsdCapPerUser);
+    if (!budget.allowed) {
+      await ctx.reply(
+        `Daily cap reached: $${budget.usedUsd.toFixed(4)} / $${budget.capUsd.toFixed(2)}.\nResets at UTC midnight.`,
+      );
+      return;
+    }
+
+    if (!deps.providers.has('openai')) {
+      await ctx.reply(
+        'Voice messages need OpenAI configured. Add `OPENAI_API_KEY` to SSM and redeploy.',
+      );
+      return;
+    }
+    const openai = deps.providers.get('openai') as OpenAIProvider;
+
+    let buf: Buffer;
+    try {
+      const file = await ctx.api.getFile(fileId);
+      const filePath = file.file_path;
+      if (!filePath) throw new Error('Telegram getFile returned no file_path');
+      const fileUrl = `https://api.telegram.org/file/bot${deps.token}/${filePath}`;
+      const res = await fetch(fileUrl, { signal: AbortSignal.timeout(20000) });
+      if (!res.ok) throw new Error(`Telegram file fetch ${res.status}`);
+      buf = Buffer.from(await res.arrayBuffer());
+    } catch (err) {
+      console.error('voice download failed', err);
+      await ctx.reply(`Couldn't download the voice note: ${(err as Error).message}`);
+      return;
+    }
+
+    let transcribed: string;
+    let durationSec: number;
+    try {
+      await ctx.replyWithChatAction('typing').catch(() => {});
+      const r = await openai.transcribe(buf, mimeType, fileName);
+      transcribed = r.text.trim();
+      durationSec = r.durationSec;
+    } catch (err) {
+      console.error('whisper failed', err);
+      await ctx.reply(`Transcription failed: ${(err as Error).message}`);
+      return;
+    }
+
+    if (!transcribed) {
+      await ctx.reply("🎙️ I couldn't make out any speech — try again?");
+      return;
+    }
+
+    // Echo what we heard so the user can verify.
+    await ctx.reply(`🎙️ ${transcribed}`);
+
+    // Bill the audio minutes alongside chat tokens.
+    if (durationSec > 0) {
+      await recordAudioSpend(deps.repo, userId, durationSec);
+    }
+
+    // Pipe through the same relay path as a typed message.
+    await relayToActiveSession(ctx, { text: transcribed }, `🎙️ ${transcribed}`);
+  }
 
   // ── shared image-relay path ─────────────────────────────────────────────
   async function handleImageMessage(
@@ -527,16 +758,23 @@ function helpText(available: ProviderId[]): string {
   return [
     'Hi! I relay your messages to an AI model and remember the conversation.',
     '',
-    `Available models: ${list}`,
+    `Available providers: ${list}`,
     '',
     'Commands:',
-    '  /model — choose model (OpenAI / Claude / Gemini)',
+    '  /model — choose provider (and a specific variant via the ⚙ button)',
     '  /new — start a new session in the current model',
     '  /sessions — list and resume previous sessions for the current model',
     '  /rename <title> — rename the active session',
     '  /forget — delete the active session',
-    '  /usage — see today’s token + cost usage',
+    '  /cancel — stop the response that\'s currently streaming',
+    '  /say — read the latest reply aloud (or reply to any message with /say to read that one)',
+    '  /usage — see today\'s token + cost usage',
     '',
-    'Just send a message to chat.',
+    'How to use:',
+    '• Send any text message to chat with the active model.',
+    '• Send a 📷 photo (or attach a JPEG/PNG document) — the AI sees the image. Add a caption to ask a specific question; otherwise it just describes it.',
+    '• Send a 🎙️ voice note or audio file — it gets transcribed via Whisper and the text is sent to the active model. The bot echoes back what it heard so you can verify.',
+    '• While a long response is streaming, send /cancel to stop early — you keep what was generated so far.',
+    '• Want to listen to a reply? Send /say to hear the latest one read back, or reply to any message with /say to hear that specific one.',
   ].join('\n');
 }

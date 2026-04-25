@@ -56,4 +56,11 @@ export interface SessionsRepo {
     tokensOut: number,
     usd: number,
   ): Promise<DailyBudget>;
+
+  /** Set a per-user cancel flag (auto-expires). Used by /cancel to interrupt streams. */
+  setCancelFlag(userId: number, ttlSec?: number): Promise<void>;
+  /** Returns true if the cancel flag is currently set. */
+  getCancelFlag(userId: number): Promise<boolean>;
+  /** Remove the cancel flag explicitly (called after a successful cancel). */
+  clearCancelFlag(userId: number): Promise<void>;
 }

@@ -76,3 +76,37 @@ export async function recordSpend(
   const updated = await repo.addBudget(userId, today, inputTokens, outputTokens, usd);
   return { usd, totalUsdToday: updated.usdEstimate };
 }
+
+/** Whisper-1 pricing (USD per minute of audio). */
+const WHISPER_PER_MINUTE_USD = 0.006;
+
+/** gpt-4o-mini-tts pricing (USD per million input characters). */
+const TTS_PER_MILLION_CHARS_USD = 15;
+
+/**
+ * Records audio-by-duration spend (e.g. Whisper transcription). Folded into
+ * the same daily USD counter; tokensIn/Out left at 0 since audio isn't
+ * token-priced.
+ */
+export async function recordAudioSpend(
+  repo: SessionsRepo,
+  userId: number,
+  durationSec: number,
+): Promise<{ usd: number; totalUsdToday: number }> {
+  const usd = (durationSec / 60) * WHISPER_PER_MINUTE_USD;
+  const today = todayDateString();
+  const updated = await repo.addBudget(userId, today, 0, 0, usd);
+  return { usd, totalUsdToday: updated.usdEstimate };
+}
+
+/** Records TTS spend (cost-per-character). Folded into the same daily counter. */
+export async function recordTtsSpend(
+  repo: SessionsRepo,
+  userId: number,
+  characters: number,
+): Promise<{ usd: number; totalUsdToday: number }> {
+  const usd = (characters / 1_000_000) * TTS_PER_MILLION_CHARS_USD;
+  const today = todayDateString();
+  const updated = await repo.addBudget(userId, today, 0, 0, usd);
+  return { usd, totalUsdToday: updated.usdEstimate };
+}

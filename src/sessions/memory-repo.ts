@@ -10,6 +10,7 @@ export class InMemorySessionsRepo implements SessionsRepo {
   private state = new Map<number, UserState>();
   private sessions = new Map<string, Session>();
   private budgets = new Map<string, DailyBudget>();
+  private cancelFlags = new Map<number, number>(); // userId → expiresAt (ms)
 
   private sessionKey(userId: number, sessionId: string) {
     return `${userId}#${sessionId}`;
@@ -68,5 +69,21 @@ export class InMemorySessionsRepo implements SessionsRepo {
     };
     this.budgets.set(key, next);
     return next;
+  }
+
+  async setCancelFlag(userId: number, ttlSec = 60): Promise<void> {
+    this.cancelFlags.set(userId, Date.now() + ttlSec * 1000);
+  }
+  async getCancelFlag(userId: number): Promise<boolean> {
+    const exp = this.cancelFlags.get(userId);
+    if (!exp) return false;
+    if (Date.now() > exp) {
+      this.cancelFlags.delete(userId);
+      return false;
+    }
+    return true;
+  }
+  async clearCancelFlag(userId: number): Promise<void> {
+    this.cancelFlags.delete(userId);
   }
 }
