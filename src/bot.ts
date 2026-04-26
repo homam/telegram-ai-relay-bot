@@ -14,7 +14,7 @@ import {
 } from './sessions/types.js';
 import type { ProviderRegistry } from './providers/registry.js';
 import { PROVIDER_LABELS } from './providers/registry.js';
-import type { UserInput } from './providers/types.js';
+import type { Citation, UserInput } from './providers/types.js';
 import { isAllowed } from './auth/allowlist.js';
 import { checkBudget, recordAudioSpend, recordSpend, recordTtsSpend } from './auth/budget.js';
 import { OpenAIProvider } from './providers/openai.js';
@@ -385,14 +385,23 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
     const trimmed = trimHistory(session.messages, MAX_HISTORY_TURNS);
 
     // Run the provider stream and tee the chunks: pass to Telegram, accumulate locally.
+    // Phase 1: hosted web search is always-on. Each provider's adapter
+    // translates `{ kind: 'web_search' }` to its native tool format
+    // (Anthropic web_search_20250305, OpenAI web_search_preview, Gemini
+    // googleSearch grounding). The model decides when to actually search.
     const gen = providerImpl.streamSend(
       trimmed,
       userInput,
       session.model || providerImpl.defaultModel,
+      { tools: [{ kind: 'web_search' }] },
     );
     const meta: {
       assembled: string;
-      final: { usage: { input: number; output: number }; model: string } | null;
+      final: {
+        usage: { input: number; output: number };
+        model: string;
+        citations?: Citation[];
+      } | null;
       cancelled: boolean;
     } = { assembled: '', final: null, cancelled: false };
 
@@ -448,7 +457,11 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
     // On cancel, we won't have provider-reported usage; estimate as 0
     // (we still record the partial output so cost is non-zero via output tokens
     // we approximate from char count below).
-    const assembled = meta.assembled;
+    // Phase 1: append a `_Sources:_` footer if the provider returned citations
+    // (typically from a hosted web_search call). Folded into `assembled` so it
+    // persists into session history alongside the answer.
+    const citationsFooter = renderCitationsFooter(meta.final?.citations);
+    const assembled = meta.assembled + (meta.cancelled ? '' : citationsFooter);
     const final = meta.final ?? {
       model: session.model || providerImpl.defaultModel,
       // Rough fallback: Approximate tokens from character count for the cancelled portion.
@@ -473,6 +486,19 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
         }
       } catch (err) {
         console.warn('post-stream MarkdownV2 reformat failed, keeping plain text:', err);
+      }
+    } else if (sentMessages.length > 1 && citationsFooter) {
+      // Multi-message responses don't get the in-place reformat — but we
+      // still want users to see citations. Send the footer as a follow-up.
+      try {
+        const formatted = telegramifyMarkdown(citationsFooter.trimStart(), 'escape');
+        await ctx.reply(formatted, {
+          parse_mode: 'MarkdownV2',
+          link_preview_options: { is_disabled: true },
+        });
+      } catch (err) {
+        console.warn('citations follow-up failed, sending plain text:', err);
+        await ctx.reply(citationsFooter.trimStart());
       }
     }
 
@@ -747,6 +773,31 @@ function trimHistory(messages: ChatMessage[], maxTurns: number): ChatMessage[] {
   const maxItems = maxTurns * 2;
   if (messages.length <= maxItems) return messages;
   return messages.slice(messages.length - maxItems);
+}
+
+/**
+ * Render a `_Sources:_` footer for citations returned by hosted tools. Used
+ * by both the in-place MarkdownV2 reformat (single-message answers) and the
+ * follow-up reply (multi-message answers). De-dupes by URL — providers
+ * sometimes surface the same source multiple times. Returns an empty string
+ * when there's nothing worth showing.
+ *
+ * The output text is plain Markdown that telegramifyMarkdown will escape;
+ * we don't pre-escape link labels here.
+ */
+function renderCitationsFooter(citations: Citation[] | undefined): string {
+  if (!citations || citations.length === 0) return '';
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const c of citations) {
+    if (!c.url || seen.has(c.url)) continue;
+    seen.add(c.url);
+    const idx = lines.length + 1;
+    const label = (c.title || '').trim() || c.url;
+    lines.push(`[${idx}] [${label}](${c.url})`);
+  }
+  if (lines.length === 0) return '';
+  return `\n\n_Sources:_\n${lines.join('\n')}`;
 }
 
 function chunkText(s: string, max: number): string[] {

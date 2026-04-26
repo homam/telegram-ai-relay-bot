@@ -5,15 +5,30 @@ export interface TokenUsage {
   output: number;
 }
 
+/**
+ * One source citation surfaced by a hosted tool (web search, web fetch,
+ * MCP tool, etc). Each provider exposes citation metadata differently —
+ * adapters normalize to this shape so the bot can render a single
+ * `_Sources:_` footer regardless of which provider answered.
+ */
+export interface Citation {
+  url: string;
+  title?: string;
+  /** Optional excerpt or page-age metadata; may be empty. */
+  snippet?: string;
+}
+
 export interface ProviderReply {
   text: string;
   usage: TokenUsage;
   model: string;
+  citations?: Citation[];
 }
 
 export interface StreamFinal {
   usage: TokenUsage;
   model: string;
+  citations?: Citation[];
 }
 
 /**
