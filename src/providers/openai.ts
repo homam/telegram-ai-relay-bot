@@ -1,14 +1,63 @@
 import OpenAI from 'openai';
-import type { ResponseInputItem, ResponseInputContent } from 'openai/resources/responses/responses.js';
+import type {
+  ResponseInputItem,
+  ResponseInputContent,
+  ResponseOutputItem,
+  Tool,
+} from 'openai/resources/responses/responses.js';
 import type { ChatMessage, ContentBlock } from '../sessions/types.js';
 import type {
   AgenticOptions,
   AIProvider,
+  Citation,
   ProviderReply,
   ProviderStream,
   SelectableModel,
+  ToolSpec,
   UserInput,
 } from './types.js';
+
+/**
+ * Translate our internal ToolSpec[] to Responses API native tool union.
+ * Returns undefined when nothing maps so we omit the param entirely.
+ *
+ * Note: SDK 4.104.0 only exposes the `web_search_preview` literal; the GA
+ * `web_search` rolls in via a later SDK bump. Phase 1 wires web_search;
+ * web_fetch and code_execution are gated to Phase 3.
+ */
+function mapTools(tools: ToolSpec[] | undefined): Tool[] | undefined {
+  if (!tools?.length) return undefined;
+  const out: Tool[] = [];
+  for (const t of tools) {
+    if (t.kind === 'web_search') {
+      out.push({ type: 'web_search_preview' });
+    }
+  }
+  return out.length ? out : undefined;
+}
+
+/**
+ * Walk the Responses API output[] for assistant messages, collect URL
+ * citations from output_text annotations, and normalize to our Citation
+ * shape. De-dupes by URL across all output_text content items.
+ */
+function extractCitations(output: ResponseOutputItem[]): Citation[] {
+  const seen = new Set<string>();
+  const out: Citation[] = [];
+  for (const item of output) {
+    if (item.type !== 'message') continue;
+    for (const c of item.content) {
+      if (c.type !== 'output_text' || !c.annotations) continue;
+      for (const a of c.annotations) {
+        if (a.type !== 'url_citation') continue;
+        if (seen.has(a.url)) continue;
+        seen.add(a.url);
+        out.push({ url: a.url, title: a.title || undefined });
+      }
+    }
+  }
+  return out;
+}
 
 /**
  * Build the user-content array for the *current* turn (text + optional images).
@@ -128,17 +177,20 @@ export class OpenAIProvider implements AIProvider {
     history: ChatMessage[],
     userInput: UserInput,
     model?: string,
-    _options?: AgenticOptions,
+    options?: AgenticOptions,
   ): Promise<ProviderReply> {
     const resolved = model ?? this.defaultModel;
     const { instructions, input } = this.prepare(history, userInput);
+    const tools = mapTools(options?.tools);
 
     const r = await this.client.responses.create({
       model: resolved,
       instructions,
       input,
+      ...(tools ? { tools } : {}),
     });
 
+    const citations = extractCitations(r.output);
     return {
       text: r.output_text ?? '',
       model: resolved,
@@ -146,6 +198,7 @@ export class OpenAIProvider implements AIProvider {
         input: r.usage?.input_tokens ?? 0,
         output: r.usage?.output_tokens ?? 0,
       },
+      ...(citations.length ? { citations } : {}),
     };
   }
 
@@ -153,42 +206,51 @@ export class OpenAIProvider implements AIProvider {
     history: ChatMessage[],
     userInput: UserInput,
     model?: string,
-    _options?: AgenticOptions,
+    options?: AgenticOptions,
   ): ProviderStream {
     const resolved = model ?? this.defaultModel;
     const { instructions, input } = this.prepare(history, userInput);
+    const tools = mapTools(options?.tools);
 
     const stream = await this.client.responses.create({
       model: resolved,
       instructions,
       input,
       stream: true,
+      ...(tools ? { tools } : {}),
     });
 
     let inputTokens = 0;
     let outputTokens = 0;
+    let citations: Citation[] = [];
     for await (const event of stream) {
       // Text deltas — the bread-and-butter case.
       if (event.type === 'response.output_text.delta') {
         if (event.delta) yield { kind: 'text', delta: event.delta };
         continue;
       }
-      // Final usage arrives on the terminal `response.completed` event.
+      // Final usage + full output (with annotations) arrive on the terminal
+      // `response.completed` event.
       if (event.type === 'response.completed') {
         const u = event.response.usage;
         if (u) {
           inputTokens = u.input_tokens;
           outputTokens = u.output_tokens;
         }
+        citations = extractCitations(event.response.output);
         continue;
       }
-      // Phase 1+ will surface tool-use start/end events here:
+      // Phase 1.6 (deferred) would surface tool-use start/end here:
       //   response.web_search_call.in_progress  → tool_use_start
       //   response.web_search_call.completed    → tool_use_end
       //   response.code_interpreter_call.*      → idem
       //   response.mcp_call.*                   → idem
     }
-    return { model: resolved, usage: { input: inputTokens, output: outputTokens } };
+    return {
+      model: resolved,
+      usage: { input: inputTokens, output: outputTokens },
+      ...(citations.length ? { citations } : {}),
+    };
   }
 
   /**
