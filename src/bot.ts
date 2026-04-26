@@ -478,14 +478,29 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
       const last = sentMessages[0]!;
       try {
         const formatted = telegramifyMarkdown(assembled, 'escape');
-        if (formatted.length <= 4096) {
+        // telegramifyMarkdown always backslash-escapes MarkdownV2 specials
+        // (`.`, `!`, `(`, `)` etc.) even in pure plain text. If the only
+        // difference between formatted and assembled is those added escapes,
+        // Telegram considers the edit a no-op and rejects with 400 "message
+        // is not modified". Skip the edit in that case — it's cheaper, and
+        // the user already sees the streamed plain text correctly.
+        const nothingToRender = formatted.replace(/\\(.)/g, '$1') === assembled;
+        if (!nothingToRender && formatted.length <= 4096) {
           await ctx.api.editMessageText(ctx.chat!.id, last.message_id, formatted, {
             parse_mode: 'MarkdownV2',
             link_preview_options: { is_disabled: true },
           });
         }
       } catch (err) {
-        console.warn('post-stream MarkdownV2 reformat failed, keeping plain text:', err);
+        // Defensive: even with the pre-check above, Telegram's own
+        // normalization may rule the edit a no-op (e.g. when zero-width
+        // characters or whitespace differ in a way our regex misses).
+        // Treat that specific 400 as success — the streamed plain text is
+        // already what the user sees.
+        const desc = (err as { description?: string })?.description ?? '';
+        if (!desc.includes('message is not modified')) {
+          console.warn('post-stream MarkdownV2 reformat failed, keeping plain text:', err);
+        }
       }
     } else if (sentMessages.length > 1 && citationsFooter) {
       // Multi-message responses don't get the in-place reformat — but we
