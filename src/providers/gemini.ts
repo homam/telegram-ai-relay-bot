@@ -1,4 +1,4 @@
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, type GroundingMetadata, type Tool } from '@google/genai';
 import {
   chatMessageText,
   type ChatMessage,
@@ -7,11 +7,49 @@ import {
 import type {
   AgenticOptions,
   AIProvider,
+  Citation,
   ProviderReply,
   ProviderStream,
   SelectableModel,
+  ToolSpec,
   UserInput,
 } from './types.js';
+
+/**
+ * Translate our internal ToolSpec[] to Gemini's tool config. Gemini's hosted
+ * grounding tools are expressed as fields on a single Tool object — there's
+ * no per-call selection like Anthropic/OpenAI. We bundle them into a single
+ * entry. Returns undefined when nothing maps so we omit the param entirely.
+ */
+function mapTools(tools: ToolSpec[] | undefined): Tool[] | undefined {
+  if (!tools?.length) return undefined;
+  const tool: Tool = {};
+  for (const t of tools) {
+    if (t.kind === 'web_search') {
+      tool.googleSearch = {};
+    }
+    // web_fetch (Gemini's `urlContext`) and code_execution are gated to Phase 3.
+  }
+  return Object.keys(tool).length ? [tool] : undefined;
+}
+
+/**
+ * Pull web citations out of grounding metadata. Gemini groups all
+ * grounding evidence under `groundingChunks[]` — we only surface the `web`
+ * variant as Citation entries (not Maps, image search, etc).
+ */
+function extractCitations(meta: GroundingMetadata | undefined): Citation[] {
+  if (!meta?.groundingChunks?.length) return [];
+  const seen = new Set<string>();
+  const out: Citation[] = [];
+  for (const chunk of meta.groundingChunks) {
+    const w = chunk.web;
+    if (!w?.uri || seen.has(w.uri)) continue;
+    seen.add(w.uri);
+    out.push({ url: w.uri, title: w.title ?? undefined });
+  }
+  return out;
+}
 
 type GeminiPart =
   | { text: string }
@@ -118,19 +156,22 @@ export class GeminiProvider implements AIProvider {
     history: ChatMessage[],
     userInput: UserInput,
     model?: string,
-    _options?: AgenticOptions,
+    options?: AgenticOptions,
   ): Promise<ProviderReply> {
     const resolved = model ?? this.defaultModel;
     const { contents, config } = this.prepare(history, userInput);
+    const tools = mapTools(options?.tools);
+    const fullConfig = tools ? { ...(config ?? {}), tools } : config;
 
     const r = await this.client.models.generateContent({
       model: resolved,
       contents,
-      config,
+      config: fullConfig,
     });
 
     const text = r.text ?? '';
     const usage = r.usageMetadata;
+    const citations = extractCitations(r.candidates?.[0]?.groundingMetadata);
 
     return {
       text,
@@ -139,6 +180,7 @@ export class GeminiProvider implements AIProvider {
         input: usage?.promptTokenCount ?? 0,
         output: usage?.candidatesTokenCount ?? 0,
       },
+      ...(citations.length ? { citations } : {}),
     };
   }
 
@@ -146,19 +188,22 @@ export class GeminiProvider implements AIProvider {
     history: ChatMessage[],
     userInput: UserInput,
     model?: string,
-    _options?: AgenticOptions,
+    options?: AgenticOptions,
   ): ProviderStream {
     const resolved = model ?? this.defaultModel;
     const { contents, config } = this.prepare(history, userInput);
+    const tools = mapTools(options?.tools);
+    const fullConfig = tools ? { ...(config ?? {}), tools } : config;
 
     const stream = await this.client.models.generateContentStream({
       model: resolved,
       contents,
-      config,
+      config: fullConfig,
     });
 
     let inputTokens = 0;
     let outputTokens = 0;
+    let lastGrounding: GroundingMetadata | undefined;
     for await (const chunk of stream) {
       if (chunk.text) yield { kind: 'text', delta: chunk.text };
       const u = chunk.usageMetadata;
@@ -166,7 +211,16 @@ export class GeminiProvider implements AIProvider {
         inputTokens = u.promptTokenCount ?? inputTokens;
         outputTokens = u.candidatesTokenCount ?? outputTokens;
       }
+      // Grounding metadata accumulates across chunks; the latest chunk
+      // carrying it has the most complete picture.
+      const g = chunk.candidates?.[0]?.groundingMetadata;
+      if (g) lastGrounding = g;
     }
-    return { model: resolved, usage: { input: inputTokens, output: outputTokens } };
+    const citations = extractCitations(lastGrounding);
+    return {
+      model: resolved,
+      usage: { input: inputTokens, output: outputTokens },
+      ...(citations.length ? { citations } : {}),
+    };
   }
 }
