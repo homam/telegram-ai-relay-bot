@@ -5,11 +5,12 @@ import { stream as streamPlugin, type StreamFlavor } from '@grammyjs/stream';
 import telegramifyMarkdown from 'telegramify-markdown';
 import { randomUUID } from 'node:crypto';
 import type { SessionsRepo } from './sessions/types.js';
-import type {
-  ChatMessage,
-  ProviderId,
-  Session,
-  UserState,
+import {
+  chatMessageText,
+  type ChatMessage,
+  type ProviderId,
+  type Session,
+  type UserState,
 } from './sessions/types.js';
 import type { ProviderRegistry } from './providers/registry.js';
 import { PROVIDER_LABELS } from './providers/registry.js';
@@ -282,8 +283,10 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
         const session = await deps.repo.getSession(userId, activeSessionId);
         for (let i = (session?.messages.length ?? 0) - 1; i >= 0; i--) {
           const m = session!.messages[i]!;
-          if (m.role === 'assistant' && m.content.trim() && m.content !== '(empty reply)') {
-            text = m.content;
+          if (m.role !== 'assistant') continue;
+          const t = chatMessageText(m);
+          if (t.trim() && t !== '(empty reply)') {
+            text = t;
             break;
           }
         }
@@ -412,9 +415,13 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
             throw new CancelError();
           }
         }
-        if (r.value) {
-          meta.assembled += r.value;
-          yield r.value;
+        // Phase 0.4: providers yield StreamChunk; we forward only text deltas
+        // to Telegram. tool_use_start / tool_use_end are wired in Phase 4 to
+        // surface a transient "🔍 searching…" status line.
+        const chunk = r.value;
+        if (chunk.kind === 'text' && chunk.delta) {
+          meta.assembled += chunk.delta;
+          yield chunk.delta;
         }
       }
     }

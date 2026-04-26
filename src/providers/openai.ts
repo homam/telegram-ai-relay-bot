@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
-import type { ChatMessage } from '../sessions/types.js';
+import { chatMessageText, type ChatMessage } from '../sessions/types.js';
 import type {
+  AgenticOptions,
   AIProvider,
   ProviderReply,
   ProviderStream,
@@ -44,10 +45,17 @@ export class OpenAIProvider implements AIProvider {
     this.defaultModel = defaultModel;
   }
 
-  async send(history: ChatMessage[], userInput: UserInput, model?: string): Promise<ProviderReply> {
+  async send(
+    history: ChatMessage[],
+    userInput: UserInput,
+    model?: string,
+    _options?: AgenticOptions,
+  ): Promise<ProviderReply> {
     const resolved = model ?? this.defaultModel;
     const messages = [
-      ...history.map((m) => ({ role: m.role, content: m.content })),
+      // Phase 0.1 compat: collapse blocks to plain text. Phase 0.3 will walk
+      // ContentBlock[] into OpenAI's tool_calls / role:'tool' message shape.
+      ...history.map((m) => ({ role: m.role, content: chatMessageText(m) })),
       { role: 'user' as const, content: buildUserContent(userInput) },
     ];
     const r = await this.client.chat.completions.create({
@@ -66,10 +74,18 @@ export class OpenAIProvider implements AIProvider {
     };
   }
 
-  async *streamSend(history: ChatMessage[], userInput: UserInput, model?: string): ProviderStream {
+  async *streamSend(
+    history: ChatMessage[],
+    userInput: UserInput,
+    model?: string,
+    _options?: AgenticOptions,
+  ): ProviderStream {
     const resolved = model ?? this.defaultModel;
     const messages = [
-      ...history.map((m) => ({ role: m.role, content: m.content })),
+      // Phase 0.1 compat: collapse blocks to plain text. Phase 0.5 will walk
+      // ContentBlock[] into the Responses API native shape (we're skipping the
+      // Chat Completions tool_calls path because it's about to be replaced).
+      ...history.map((m) => ({ role: m.role, content: chatMessageText(m) })),
       { role: 'user' as const, content: buildUserContent(userInput) },
     ];
     const stream = await this.client.chat.completions.create({
@@ -82,7 +98,7 @@ export class OpenAIProvider implements AIProvider {
     let outputTokens = 0;
     for await (const chunk of stream) {
       const delta = chunk.choices[0]?.delta?.content ?? '';
-      if (delta) yield delta;
+      if (delta) yield { kind: 'text', delta };
       if (chunk.usage) {
         inputTokens = chunk.usage.prompt_tokens;
         outputTokens = chunk.usage.completion_tokens;

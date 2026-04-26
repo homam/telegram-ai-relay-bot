@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { InMemorySessionsRepo } from '../src/sessions/memory-repo.js';
-import type { Session } from '../src/sessions/types.js';
+import { chatMessageText, type ChatMessage, type Session } from '../src/sessions/types.js';
 import {
   estimateUsd,
   todayDateString,
@@ -49,6 +49,33 @@ describe('InMemorySessionsRepo', () => {
     await repo.createSession(mkSession({ sessionId: 'c', provider: 'anthropic', lastUsedAt: 10 }));
     const list = await repo.listSessions(1, 'openai', 10);
     expect(list.map((s) => s.sessionId)).toEqual(['b', 'a']);
+  });
+
+  it('round-trips a session with ContentBlock[] message content', async () => {
+    const repo = new InMemorySessionsRepo();
+    const blocks: ChatMessage[] = [
+      { role: 'user', content: 'hello', ts: 1 }, // legacy string content
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'I will search.' },
+          { type: 'tool_use', id: 'tu_1', name: 'web_search', input: { query: 'today' } },
+          { type: 'tool_result', tool_use_id: 'tu_1', content: 'results...' },
+          { type: 'text', text: 'Here is the answer.' },
+        ],
+        ts: 2,
+      },
+    ];
+    await repo.createSession(mkSession({ messages: blocks }));
+    const got = await repo.getSession(1, 'sess-1');
+    expect(got?.messages).toHaveLength(2);
+    // Legacy string content survives unchanged.
+    expect(got?.messages[0]!.content).toBe('hello');
+    // Block content survives as the same array (deep-equal, post-clone).
+    expect(got?.messages[1]!.content).toEqual(blocks[1]!.content);
+    // chatMessageText helper extracts plain text across both shapes.
+    expect(chatMessageText(got!.messages[0]!)).toBe('hello');
+    expect(chatMessageText(got!.messages[1]!)).toBe('I will search.results...Here is the answer.');
   });
 
   it('atomically accumulates budget', async () => {
