@@ -14,9 +14,9 @@ import {
 } from './sessions/types.js';
 import type { ProviderRegistry } from './providers/registry.js';
 import { PROVIDER_LABELS } from './providers/registry.js';
-import type { Citation, UserInput } from './providers/types.js';
+import type { Citation, ToolCallCounts, UserInput } from './providers/types.js';
 import { isAllowed } from './auth/allowlist.js';
-import { checkBudget, recordAudioSpend, recordSpend, recordTtsSpend } from './auth/budget.js';
+import { checkBudget, recordAudioSpend, recordSpend, recordToolSpend, recordTtsSpend } from './auth/budget.js';
 import { OpenAIProvider } from './providers/openai.js';
 import { modelKeyboard, sessionsKeyboard, variantKeyboard } from './ui/keyboards.js';
 
@@ -523,6 +523,7 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
         usage: { input: number; output: number };
         model: string;
         citations?: Citation[];
+        toolCalls?: ToolCallCounts;
       } | null;
       cancelled: boolean;
     } = { assembled: '', final: null, cancelled: false };
@@ -676,6 +677,11 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
       final.usage.input,
       final.usage.output,
     );
+    // Phase 4.1: hosted-tool per-call surcharges (web_search, etc.) are
+    // billed separately from token cost. Folds into the same daily cap.
+    if (meta.final?.toolCalls) {
+      await recordToolSpend(deps.repo, userId, provider, meta.final.toolCalls);
+    }
   }
 
   // ── plain text ──────────────────────────────────────────────────────────

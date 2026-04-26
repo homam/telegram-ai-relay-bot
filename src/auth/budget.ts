@@ -1,5 +1,6 @@
 import type { ProviderId } from '../sessions/types.js';
 import type { SessionsRepo } from '../sessions/types.js';
+import type { ToolCallCounts } from '../providers/types.js';
 
 /**
  * Approximate input/output prices in USD per 1 million tokens.
@@ -106,6 +107,59 @@ export async function recordTtsSpend(
   characters: number,
 ): Promise<{ usd: number; totalUsdToday: number }> {
   const usd = (characters / 1_000_000) * TTS_PER_MILLION_CHARS_USD;
+  const today = todayDateString();
+  const updated = await repo.addBudget(userId, today, 0, 0, usd);
+  return { usd, totalUsdToday: updated.usdEstimate };
+}
+
+/**
+ * Per-call surcharges for provider-hosted agentic tools, USD per call.
+ * Verified April 2026; these are guardrail estimates — providers may
+ * tier prices by model (OpenAI charges $25/1k for non-reasoning models,
+ * $10/1k for reasoning models) and we approximate to the higher figure
+ * for safety. MCP tool calls are NOT listed here: they bill via the
+ * model's input/output tokens only, no separate per-call surcharge.
+ *
+ * Sources:
+ *   Anthropic web search: $10 / 1k searches
+ *   OpenAI web search:    $25 / 1k calls (preview, non-reasoning tier)
+ *   Gemini googleSearch:  free
+ */
+const TOOL_PRICES: Record<keyof ToolCallCounts, Partial<Record<ProviderId, number>>> = {
+  web_search: {
+    anthropic: 10 / 1000,
+    openai: 25 / 1000,
+    gemini: 0,
+  },
+};
+
+export function estimateToolUsd(
+  provider: ProviderId,
+  toolCalls: ToolCallCounts | undefined,
+): number {
+  if (!toolCalls) return 0;
+  let usd = 0;
+  for (const [tool, count] of Object.entries(toolCalls) as [keyof ToolCallCounts, number][]) {
+    const rate = TOOL_PRICES[tool]?.[provider] ?? 0;
+    usd += count * rate;
+  }
+  return usd;
+}
+
+/**
+ * Records hosted-tool surcharge spend (e.g. web_search per-call fee).
+ * Folded into the same daily USD counter so the cap covers tool spend
+ * alongside model tokens. tokensIn/Out left at 0 — these surcharges
+ * sit outside the token-cost line.
+ */
+export async function recordToolSpend(
+  repo: SessionsRepo,
+  userId: number,
+  provider: ProviderId,
+  toolCalls: ToolCallCounts | undefined,
+): Promise<{ usd: number; totalUsdToday: number } | null> {
+  const usd = estimateToolUsd(provider, toolCalls);
+  if (usd <= 0) return null;
   const today = todayDateString();
   const updated = await repo.addBudget(userId, today, 0, 0, usd);
   return { usd, totalUsdToday: updated.usdEstimate };

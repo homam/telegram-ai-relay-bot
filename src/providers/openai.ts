@@ -52,6 +52,15 @@ function mapTools(
   return out.length ? out : undefined;
 }
 
+/** Count hosted-tool calls in the Responses API output[] for billing. */
+function countWebSearchCalls(output: ResponseOutputItem[]): number {
+  let n = 0;
+  for (const item of output) {
+    if (item.type === 'web_search_call') n++;
+  }
+  return n;
+}
+
 /**
  * Walk the Responses API output[] for assistant messages, collect URL
  * citations from output_text annotations, and normalize to our Citation
@@ -207,6 +216,7 @@ export class OpenAIProvider implements AIProvider {
     });
 
     const citations = extractCitations(r.output);
+    const webSearches = countWebSearchCalls(r.output);
     return {
       text: r.output_text ?? '',
       model: resolved,
@@ -215,6 +225,7 @@ export class OpenAIProvider implements AIProvider {
         output: r.usage?.output_tokens ?? 0,
       },
       ...(citations.length ? { citations } : {}),
+      ...(webSearches > 0 ? { toolCalls: { web_search: webSearches } } : {}),
     };
   }
 
@@ -239,6 +250,7 @@ export class OpenAIProvider implements AIProvider {
     let inputTokens = 0;
     let outputTokens = 0;
     let citations: Citation[] = [];
+    let webSearches = 0;
     for await (const event of stream) {
       // Text deltas — the bread-and-butter case.
       if (event.type === 'response.output_text.delta') {
@@ -254,6 +266,7 @@ export class OpenAIProvider implements AIProvider {
           outputTokens = u.output_tokens;
         }
         citations = extractCitations(event.response.output);
+        webSearches = countWebSearchCalls(event.response.output);
         continue;
       }
       // Phase 1.6 (deferred) would surface tool-use start/end here:
@@ -266,6 +279,7 @@ export class OpenAIProvider implements AIProvider {
       model: resolved,
       usage: { input: inputTokens, output: outputTokens },
       ...(citations.length ? { citations } : {}),
+      ...(webSearches > 0 ? { toolCalls: { web_search: webSearches } } : {}),
     };
   }
 

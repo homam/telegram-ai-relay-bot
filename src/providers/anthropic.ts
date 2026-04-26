@@ -221,6 +221,7 @@ export class AnthropicProvider implements AIProvider {
       .map((b) => b.text)
       .join('');
     const citations = extractCitations(content);
+    const webSearches = r.usage.server_tool_use?.web_search_requests ?? 0;
 
     return {
       text,
@@ -230,6 +231,7 @@ export class AnthropicProvider implements AIProvider {
         output: r.usage.output_tokens,
       },
       ...(citations.length ? { citations } : {}),
+      ...(webSearches > 0 ? { toolCalls: { web_search: webSearches } } : {}),
     };
   }
 
@@ -274,10 +276,12 @@ export class AnthropicProvider implements AIProvider {
     }
     const final = await stream.finalMessage();
     const citations = extractCitations(final.content as Anthropic.ContentBlock[]);
+    const webSearches = final.usage.server_tool_use?.web_search_requests ?? 0;
     return {
       model: resolved,
       usage: { input: final.usage.input_tokens, output: final.usage.output_tokens },
       ...(citations.length ? { citations } : {}),
+      ...(webSearches > 0 ? { toolCalls: { web_search: webSearches } } : {}),
     };
   }
 }

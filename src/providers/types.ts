@@ -18,17 +18,33 @@ export interface Citation {
   snippet?: string;
 }
 
+/**
+ * Per-turn count of hosted-tool invocations the provider billed us for.
+ * Each provider populates this from its response shape — Anthropic via
+ * `usage.server_tool_use.web_search_requests`, OpenAI Responses by counting
+ * `web_search_call` items in `response.output[]`, Gemini's googleSearch
+ * grounding is currently free so we leave the field undefined.
+ *
+ * The bot folds these counts into the daily USD cap via TOOL_PRICES.
+ */
+export interface ToolCallCounts {
+  /** Hosted web-search calls (Anthropic web_search_20250305, OpenAI web_search_preview). */
+  web_search?: number;
+}
+
 export interface ProviderReply {
   text: string;
   usage: TokenUsage;
   model: string;
   citations?: Citation[];
+  toolCalls?: ToolCallCounts;
 }
 
 export interface StreamFinal {
   usage: TokenUsage;
   model: string;
   citations?: Citation[];
+  toolCalls?: ToolCallCounts;
 }
 
 /**

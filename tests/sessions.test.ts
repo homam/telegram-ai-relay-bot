@@ -3,9 +3,11 @@ import { InMemorySessionsRepo } from '../src/sessions/memory-repo.js';
 import { chatMessageText, type ChatMessage, type Session } from '../src/sessions/types.js';
 import {
   estimateUsd,
+  estimateToolUsd,
   todayDateString,
   checkBudget,
   recordSpend,
+  recordToolSpend,
 } from '../src/auth/budget.js';
 import { isAllowed, parseAllowedUserIds } from '../src/auth/allowlist.js';
 
@@ -139,6 +141,35 @@ describe('budget pricing', () => {
   it('falls back for unknown model', () => {
     const usd = estimateUsd('openai', 'unknown-model', 1_000_000, 0);
     expect(usd).toBeGreaterThan(0);
+  });
+
+  it('prices web_search tool calls per provider', () => {
+    // Anthropic: $10 / 1k searches → $0.01/call
+    expect(estimateToolUsd('anthropic', { web_search: 1 })).toBeCloseTo(0.01, 6);
+    expect(estimateToolUsd('anthropic', { web_search: 5 })).toBeCloseTo(0.05, 6);
+    // OpenAI: $25 / 1k calls → $0.025/call
+    expect(estimateToolUsd('openai', { web_search: 1 })).toBeCloseTo(0.025, 6);
+    // Gemini grounding is currently free
+    expect(estimateToolUsd('gemini', { web_search: 3 })).toBe(0);
+    // No counts → no spend
+    expect(estimateToolUsd('anthropic', undefined)).toBe(0);
+    expect(estimateToolUsd('anthropic', {})).toBe(0);
+  });
+
+  it('recordToolSpend folds into the daily USD counter and skips when zero', async () => {
+    const repo = new InMemorySessionsRepo();
+    // Zero spend → returns null, doesn't touch DDB
+    const noop = await recordToolSpend(repo, 1, 'gemini', { web_search: 5 });
+    expect(noop).toBeNull();
+    // Real spend on Anthropic → $0.02
+    const r = await recordToolSpend(repo, 1, 'anthropic', { web_search: 2 });
+    expect(r?.usd).toBeCloseTo(0.02, 6);
+    expect(r?.totalUsdToday).toBeCloseTo(0.02, 6);
+    // tokensIn/Out should NOT be incremented by tool spend
+    const today = todayDateString();
+    const b = await repo.getBudget(1, today);
+    expect(b?.tokensIn).toBe(0);
+    expect(b?.tokensOut).toBe(0);
   });
 
   it('checks and refuses past cap', async () => {
