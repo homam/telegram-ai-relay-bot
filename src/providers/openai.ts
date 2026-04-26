@@ -1,5 +1,6 @@
 import OpenAI from 'openai';
-import { chatMessageText, type ChatMessage } from '../sessions/types.js';
+import type { ResponseInputItem, ResponseInputContent } from 'openai/resources/responses/responses.js';
+import type { ChatMessage, ContentBlock } from '../sessions/types.js';
 import type {
   AgenticOptions,
   AIProvider,
@@ -9,22 +10,59 @@ import type {
   UserInput,
 } from './types.js';
 
-type UserContent =
-  | string
-  | Array<
-      | { type: 'text'; text: string }
-      | { type: 'image_url'; image_url: { url: string } }
-    >;
-
-function buildUserContent(input: UserInput): UserContent {
+/**
+ * Build the user-content array for the *current* turn (text + optional images).
+ * Uses the Responses API content-item shape: `input_text` and `input_image`.
+ */
+function buildUserContent(input: UserInput): string | ResponseInputContent[] {
   if (!input.images?.length) return input.text;
-  const parts: Exclude<UserContent, string> = [{ type: 'text', text: input.text }];
+  const parts: ResponseInputContent[] = [{ type: 'input_text', text: input.text }];
   for (const img of input.images) {
     parts.push({
-      type: 'image_url',
-      image_url: { url: `data:${img.mimeType};base64,${img.base64}` },
+      type: 'input_image',
+      image_url: `data:${img.mimeType};base64,${img.base64}`,
+      detail: 'auto',
     });
   }
+  return parts;
+}
+
+/**
+ * Map our internal ContentBlock[] to a Responses API user/assistant message
+ * `content` value. Tool blocks are NOT mapped here — they have to be split
+ * into separate `function_call` / `function_call_output` items at the
+ * prepare() level. For Phase 0 nothing in history actually carries tool
+ * blocks yet (no tool is enabled until Phase 1), so we conservatively drop
+ * unknown variants and log once.
+ */
+function blocksToResponsesContent(
+  blocks: ContentBlock[],
+  role: 'user' | 'assistant' | 'system',
+): string | ResponseInputContent[] {
+  const parts: ResponseInputContent[] = [];
+  for (const b of blocks) {
+    if (b.type === 'text') {
+      parts.push({ type: 'input_text', text: b.text });
+    } else if (b.type === 'image') {
+      // Images are only valid on user role.
+      if (role !== 'user') continue;
+      parts.push({
+        type: 'input_image',
+        image_url: `data:${b.mimeType};base64,${b.base64}`,
+        detail: 'auto',
+      });
+    } else {
+      // tool_use / tool_result need separate ResponseInputItem entries
+      // (function_call / function_call_output) — they cannot live inside a
+      // message content array. They're skipped here; prepare() handles them.
+      // Phase 1 will fill in the proper item-emission path.
+    }
+  }
+  // Collapse single-text-part to a string so the API call is more readable.
+  if (parts.length === 1 && parts[0]!.type === 'input_text') {
+    return (parts[0] as { type: 'input_text'; text: string }).text;
+  }
+  if (parts.length === 0) return '';
   return parts;
 }
 
@@ -45,6 +83,47 @@ export class OpenAIProvider implements AIProvider {
     this.defaultModel = defaultModel;
   }
 
+  /**
+   * Build the Responses API request payload. System messages are joined and
+   * lifted into the top-level `instructions` field (Responses API's preferred
+   * pattern). Everything else becomes a `ResponseInputItem`.
+   */
+  private prepare(history: ChatMessage[], userInput: UserInput) {
+    const systemParts: string[] = [];
+    const items: ResponseInputItem[] = [];
+
+    for (const m of history) {
+      if (m.role === 'system') {
+        const text = typeof m.content === 'string' ? m.content : (() => {
+          const c = blocksToResponsesContent(m.content, 'system');
+          return typeof c === 'string' ? c : '';
+        })();
+        if (text) systemParts.push(text);
+        continue;
+      }
+      const role: 'user' | 'assistant' = m.role === 'assistant' ? 'assistant' : 'user';
+      if (typeof m.content === 'string') {
+        items.push({ role, content: m.content, type: 'message' });
+      } else {
+        // Phase 0 only emits text/image content; tool_use / tool_result blocks
+        // (which won't appear until Phase 1) need to be split into separate
+        // function_call / function_call_output items. Punted until then.
+        const content = blocksToResponsesContent(m.content, role);
+        if (content !== '') {
+          items.push({ role, content, type: 'message' });
+        }
+      }
+    }
+
+    // Append the current turn.
+    items.push({ role: 'user', content: buildUserContent(userInput), type: 'message' });
+
+    return {
+      instructions: systemParts.length ? systemParts.join('\n\n') : undefined,
+      input: items,
+    };
+  }
+
   async send(
     history: ChatMessage[],
     userInput: UserInput,
@@ -52,24 +131,20 @@ export class OpenAIProvider implements AIProvider {
     _options?: AgenticOptions,
   ): Promise<ProviderReply> {
     const resolved = model ?? this.defaultModel;
-    const messages = [
-      // Phase 0.1 compat: collapse blocks to plain text. Phase 0.3 will walk
-      // ContentBlock[] into OpenAI's tool_calls / role:'tool' message shape.
-      ...history.map((m) => ({ role: m.role, content: chatMessageText(m) })),
-      { role: 'user' as const, content: buildUserContent(userInput) },
-    ];
-    const r = await this.client.chat.completions.create({
+    const { instructions, input } = this.prepare(history, userInput);
+
+    const r = await this.client.responses.create({
       model: resolved,
-      // The OpenAI SDK accepts either string or content-array for `content`.
-      messages: messages as never,
+      instructions,
+      input,
     });
-    const text = r.choices[0]?.message?.content ?? '';
+
     return {
-      text,
+      text: r.output_text ?? '',
       model: resolved,
       usage: {
-        input: r.usage?.prompt_tokens ?? 0,
-        output: r.usage?.completion_tokens ?? 0,
+        input: r.usage?.input_tokens ?? 0,
+        output: r.usage?.output_tokens ?? 0,
       },
     };
   }
@@ -81,28 +156,37 @@ export class OpenAIProvider implements AIProvider {
     _options?: AgenticOptions,
   ): ProviderStream {
     const resolved = model ?? this.defaultModel;
-    const messages = [
-      // Phase 0.1 compat: collapse blocks to plain text. Phase 0.5 will walk
-      // ContentBlock[] into the Responses API native shape (we're skipping the
-      // Chat Completions tool_calls path because it's about to be replaced).
-      ...history.map((m) => ({ role: m.role, content: chatMessageText(m) })),
-      { role: 'user' as const, content: buildUserContent(userInput) },
-    ];
-    const stream = await this.client.chat.completions.create({
+    const { instructions, input } = this.prepare(history, userInput);
+
+    const stream = await this.client.responses.create({
       model: resolved,
-      messages: messages as never,
+      instructions,
+      input,
       stream: true,
-      stream_options: { include_usage: true },
     });
+
     let inputTokens = 0;
     let outputTokens = 0;
-    for await (const chunk of stream) {
-      const delta = chunk.choices[0]?.delta?.content ?? '';
-      if (delta) yield { kind: 'text', delta };
-      if (chunk.usage) {
-        inputTokens = chunk.usage.prompt_tokens;
-        outputTokens = chunk.usage.completion_tokens;
+    for await (const event of stream) {
+      // Text deltas — the bread-and-butter case.
+      if (event.type === 'response.output_text.delta') {
+        if (event.delta) yield { kind: 'text', delta: event.delta };
+        continue;
       }
+      // Final usage arrives on the terminal `response.completed` event.
+      if (event.type === 'response.completed') {
+        const u = event.response.usage;
+        if (u) {
+          inputTokens = u.input_tokens;
+          outputTokens = u.output_tokens;
+        }
+        continue;
+      }
+      // Phase 1+ will surface tool-use start/end events here:
+      //   response.web_search_call.in_progress  → tool_use_start
+      //   response.web_search_call.completed    → tool_use_end
+      //   response.code_interpreter_call.*      → idem
+      //   response.mcp_call.*                   → idem
     }
     return { model: resolved, usage: { input: inputTokens, output: outputTokens } };
   }

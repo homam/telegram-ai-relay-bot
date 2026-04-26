@@ -89,7 +89,11 @@ bash scripts/push-secrets.sh   # uploads .env.local values to SSM (USER runs thi
 
 ## Local dev nuance
 
-Running `npm run dev` calls `bot.start()` which **automatically `deleteWebhook`s on Telegram** to use long-polling. After local dev, the production webhook is gone — you must `npm run set-webhook -- <url>` to restore it. If the deployed bot suddenly goes silent, suspect this first.
+`npm run dev` uses a **separate dev bot** (@pam_ai_relay_dev_bot) so it never touches production. The script reads `TELEGRAM_BOT_TOKEN_DEV` from `.env.local`; the production token in `TELEGRAM_BOT_TOKEN` (kept around for `scripts/push-secrets.sh` and `scripts/set-webhook.ts`) is left alone.
+
+If `TELEGRAM_BOT_TOKEN_DEV` is missing, the script falls back to `TELEGRAM_BOT_TOKEN` with a loud warning — and that path is still the old footgun: `bot.start()` calls `deleteWebhook` on whatever bot the token points to, so falling back deletes the production webhook. Restore it with `npm run set-webhook -- <url>` if you tripped on this.
+
+To create a dev bot from scratch: chat with @BotFather → `/newbot` → pick a name and a username ending in `bot` → paste the issued token into `.env.local` as `TELEGRAM_BOT_TOKEN_DEV=...`. The dev bot uses the in-memory storage backend by default (no DDB needed) and the same `ALLOWED_USER_IDS` allowlist as prod.
 
 ## Verifying it's healthy
 
