@@ -9,6 +9,7 @@ import {
 } from '@aws-sdk/lib-dynamodb';
 import type {
   DailyBudget,
+  McpServerRecord,
   ProviderId,
   Session,
   SessionsRepo,
@@ -22,6 +23,8 @@ const sessionSk = (provider: ProviderId, sessionId: string) =>
 const sessionPrefix = (provider: ProviderId) => `SESSION#${provider}#`;
 const budgetSk = (date: string) => `BUDGET#${date}`;
 const cancelSk = () => 'CANCEL';
+const mcpSk = (name: string) => `MCP#${name}`;
+const mcpPrefix = () => 'MCP#';
 
 const BUDGET_TTL_DAYS = 40;
 
@@ -196,6 +199,66 @@ export class DynamoSessionsRepo implements SessionsRepo {
     await this.doc.send(
       new DeleteCommand({ TableName: this.table, Key: { pk: userPk(userId), sk: cancelSk() } }),
     );
+  }
+
+  async listMcpServers(userId: number): Promise<McpServerRecord[]> {
+    const r = await this.doc.send(
+      new QueryCommand({
+        TableName: this.table,
+        KeyConditionExpression: 'pk = :pk AND begins_with(sk, :prefix)',
+        ExpressionAttributeValues: { ':pk': userPk(userId), ':prefix': mcpPrefix() },
+      }),
+    );
+    const out = (r.Items ?? []).map((i) => this.mcpFromItem(i, userId));
+    out.sort((a, b) => a.addedAt - b.addedAt);
+    return out;
+  }
+
+  async getMcpServer(userId: number, name: string): Promise<McpServerRecord | null> {
+    const r = await this.doc.send(
+      new GetCommand({
+        TableName: this.table,
+        Key: { pk: userPk(userId), sk: mcpSk(name) },
+      }),
+    );
+    return r.Item ? this.mcpFromItem(r.Item, userId) : null;
+  }
+
+  async putMcpServer(record: McpServerRecord): Promise<void> {
+    await this.doc.send(
+      new PutCommand({
+        TableName: this.table,
+        Item: {
+          pk: userPk(record.userId),
+          sk: mcpSk(record.name),
+          name: record.name,
+          url: record.url,
+          authToken: record.authToken,
+          enabled: record.enabled,
+          addedAt: record.addedAt,
+        },
+      }),
+    );
+  }
+
+  async deleteMcpServer(userId: number, name: string): Promise<void> {
+    await this.doc.send(
+      new DeleteCommand({
+        TableName: this.table,
+        Key: { pk: userPk(userId), sk: mcpSk(name) },
+      }),
+    );
+  }
+
+  private mcpFromItem(i: Record<string, unknown>, userId: number): McpServerRecord {
+    return {
+      userId,
+      name: i.name as string,
+      url: i.url as string,
+      authToken: (i.authToken as string | undefined) ?? undefined,
+      enabled: (i.enabled as boolean | undefined) ?? true,
+      addedAt: (i.addedAt as number | undefined) ?? 0,
+    };
   }
 
   private toItem(s: Session) {

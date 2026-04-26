@@ -36,6 +36,7 @@ const MAX_HISTORY_TURNS = 40;
 const MAX_TG_MESSAGE_LEN = 4000;
 const SESSION_LIST_LIMIT = 10;
 const CANCEL_POLL_MS = 500;
+const MAX_MCP_SERVERS_PER_USER = 10;
 
 class CancelError extends Error {
   constructor() {
@@ -244,6 +245,116 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
     );
   });
 
+  // ── /mcp — manage remote MCP servers (per-user) ─────────────────────────
+  bot.command('mcp', async (ctx) => {
+    const userId = ctx.from!.id;
+    const args = (ctx.match ?? '').toString().trim().split(/\s+/).filter(Boolean);
+    const sub = (args[0] ?? '').toLowerCase();
+
+    if (!sub || sub === 'list') {
+      const servers = await deps.repo.listMcpServers(userId);
+      if (servers.length === 0) {
+        await ctx.reply(
+          'No MCP servers registered. Add one with:\n' +
+            '  /mcp add <name> <https-url> [auth-token]\n\n' +
+            'Examples: /mcp add deepwiki https://mcp.deepwiki.com/sse\n' +
+            '          /mcp add linear https://mcp.linear.app/sse <oauth-token>',
+        );
+        return;
+      }
+      const lines = servers.map((s) => {
+        const flag = s.enabled ? '✓' : '✗';
+        const auth = s.authToken ? ' 🔑' : '';
+        const url = s.url.length > 60 ? s.url.slice(0, 57) + '…' : s.url;
+        return `${flag} ${s.name}${auth} — ${url}`;
+      });
+      await ctx.reply(
+        `MCP servers (${servers.length}):\n${lines.join('\n')}\n\n` +
+          'Subcommands: /mcp add|remove|enable|disable',
+      );
+      return;
+    }
+
+    if (sub === 'add') {
+      const name = args[1];
+      const url = args[2];
+      const authToken = args.slice(3).join(' ') || undefined;
+      if (!name || !url) {
+        await ctx.reply('Usage: /mcp add <name> <https-url> [auth-token]');
+        return;
+      }
+      if (!/^[a-zA-Z0-9_-]{1,32}$/.test(name)) {
+        await ctx.reply('Name must be 1–32 chars, letters/digits/`_`/`-` only.');
+        return;
+      }
+      if (!url.startsWith('https://')) {
+        await ctx.reply('URL must start with `https://`.');
+        return;
+      }
+      const existing = await deps.repo.listMcpServers(userId);
+      if (existing.length >= MAX_MCP_SERVERS_PER_USER && !existing.find((s) => s.name === name)) {
+        await ctx.reply(`Limit reached (${MAX_MCP_SERVERS_PER_USER} servers). Remove one first.`);
+        return;
+      }
+      await deps.repo.putMcpServer({
+        userId,
+        name,
+        url,
+        authToken,
+        enabled: true,
+        addedAt: Date.now(),
+      });
+      const tip = authToken
+        ? '\n\n💡 Tip: the auth token is now stored on my side. ' +
+          'You may want to delete your /mcp message in this chat (long-press → Delete for everyone).'
+        : '';
+      await ctx.reply(`✓ Registered MCP server "${name}".${tip}`);
+      return;
+    }
+
+    if (sub === 'remove') {
+      const name = args[1];
+      if (!name) {
+        await ctx.reply('Usage: /mcp remove <name>');
+        return;
+      }
+      const existing = await deps.repo.getMcpServer(userId, name);
+      if (!existing) {
+        await ctx.reply(`No server named "${name}".`);
+        return;
+      }
+      await deps.repo.deleteMcpServer(userId, name);
+      await ctx.reply(`✓ Removed "${name}".`);
+      return;
+    }
+
+    if (sub === 'enable' || sub === 'disable') {
+      const name = args[1];
+      if (!name) {
+        await ctx.reply(`Usage: /mcp ${sub} <name>`);
+        return;
+      }
+      const existing = await deps.repo.getMcpServer(userId, name);
+      if (!existing) {
+        await ctx.reply(`No server named "${name}".`);
+        return;
+      }
+      const enabled = sub === 'enable';
+      await deps.repo.putMcpServer({ ...existing, enabled });
+      await ctx.reply(`${enabled ? '✓ Enabled' : '✗ Disabled'} "${name}".`);
+      return;
+    }
+
+    await ctx.reply(
+      'Unknown /mcp subcommand. Try:\n' +
+        '  /mcp list\n' +
+        '  /mcp add <name> <url> [auth-token]\n' +
+        '  /mcp remove <name>\n' +
+        '  /mcp enable <name>\n' +
+        '  /mcp disable <name>',
+    );
+  });
+
   // ── /cancel — interrupt an in-flight stream ─────────────────────────────
   bot.command('cancel', async (ctx) => {
     await deps.repo.setCancelFlag(ctx.from!.id);
@@ -384,6 +495,14 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
     // Trim history sent to provider (keep full history in storage)
     const trimmed = trimHistory(session.messages, MAX_HISTORY_TURNS);
 
+    // Phase 2: load this user's enabled MCP servers. Anthropic and OpenAI
+    // run the MCP client server-side; Gemini ignores this list (no native
+    // remote-MCP support — it just gets web_search).
+    const allMcp = await deps.repo.listMcpServers(userId);
+    const mcpServers = allMcp
+      .filter((s) => s.enabled)
+      .map((s) => ({ name: s.name, url: s.url, authToken: s.authToken }));
+
     // Run the provider stream and tee the chunks: pass to Telegram, accumulate locally.
     // Phase 1: hosted web search is always-on. Each provider's adapter
     // translates `{ kind: 'web_search' }` to its native tool format
@@ -393,7 +512,10 @@ export function createBot(deps: BotDeps): Bot<AppContext> {
       trimmed,
       userInput,
       session.model || providerImpl.defaultModel,
-      { tools: [{ kind: 'web_search' }] },
+      {
+        tools: [{ kind: 'web_search' }],
+        ...(mcpServers.length ? { mcpServers } : {}),
+      },
     );
     const meta: {
       assembled: string;
@@ -842,6 +964,7 @@ function helpText(available: ProviderId[]): string {
     '  /cancel — stop the response that\'s currently streaming',
     '  /say — read the latest reply aloud (or reply to any message with /say to read that one)',
     '  /usage — see today\'s token + cost usage',
+    '  /mcp — manage remote MCP servers (Claude + OpenAI; /mcp list to start)',
     '',
     'How to use:',
     '• Send any text message to chat with the active model.',

@@ -89,6 +89,46 @@ describe('InMemorySessionsRepo', () => {
   });
 });
 
+describe('InMemorySessionsRepo MCP servers', () => {
+  it('round-trips a server, then deletes it', async () => {
+    const repo = new InMemorySessionsRepo();
+    expect(await repo.listMcpServers(1)).toEqual([]);
+    await repo.putMcpServer({
+      userId: 1,
+      name: 'github',
+      url: 'https://mcp.github.com',
+      authToken: 'tok',
+      enabled: true,
+      addedAt: 100,
+    });
+    const got = await repo.getMcpServer(1, 'github');
+    expect(got?.url).toBe('https://mcp.github.com');
+    expect(got?.authToken).toBe('tok');
+    expect(got?.enabled).toBe(true);
+    await repo.deleteMcpServer(1, 'github');
+    expect(await repo.getMcpServer(1, 'github')).toBeNull();
+  });
+
+  it('lists by user, sorted by addedAt asc, isolated per-user', async () => {
+    const repo = new InMemorySessionsRepo();
+    await repo.putMcpServer({ userId: 1, name: 'b', url: 'u-b', enabled: true, addedAt: 5 });
+    await repo.putMcpServer({ userId: 1, name: 'a', url: 'u-a', enabled: false, addedAt: 1 });
+    await repo.putMcpServer({ userId: 2, name: 'a', url: 'u-other', enabled: true, addedAt: 3 });
+    const u1 = await repo.listMcpServers(1);
+    expect(u1.map((r) => r.name)).toEqual(['a', 'b']);
+    const u2 = await repo.listMcpServers(2);
+    expect(u2.map((r) => r.url)).toEqual(['u-other']);
+  });
+
+  it('toggles enabled state via putMcpServer overwrite', async () => {
+    const repo = new InMemorySessionsRepo();
+    await repo.putMcpServer({ userId: 1, name: 'x', url: 'u', enabled: true, addedAt: 1 });
+    const cur = await repo.getMcpServer(1, 'x');
+    await repo.putMcpServer({ ...cur!, enabled: false });
+    expect((await repo.getMcpServer(1, 'x'))?.enabled).toBe(false);
+  });
+});
+
 describe('budget pricing', () => {
   it('estimates known model price', () => {
     // gpt-4o-mini: $0.15 / $0.60 per Mtok

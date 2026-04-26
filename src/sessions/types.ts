@@ -62,6 +62,31 @@ export interface DailyBudget {
   usdEstimate: number;
 }
 
+/**
+ * A registered remote MCP server that a user can use to extend their bot
+ * with third-party tools (GitHub, Linear, Notion, etc). The provider runs
+ * the MCP client server-side (Anthropic's `mcp_servers` param, OpenAI
+ * Responses' `tools[].mcp`) — we just pass URLs through.
+ */
+export interface McpServerRecord {
+  userId: number;
+  /**
+   * User-chosen identifier, surfaced to the model in tool calls. Must be
+   * unique per user. Validated against /^[a-z0-9_-]+$/i to keep it safe to
+   * use as a DDB sort key suffix and as a server label.
+   */
+  name: string;
+  url: string;
+  /**
+   * Optional bearer token. Sent as `Authorization: Bearer <token>` to the
+   * MCP server by the provider. Treat as a secret.
+   */
+  authToken?: string;
+  /** When false, the server is registered but not used in `relayToActiveSession`. */
+  enabled: boolean;
+  addedAt: number;
+}
+
 export interface SessionsRepo {
   getState(userId: number): Promise<UserState | null>;
   putState(state: UserState): Promise<void>;
@@ -87,4 +112,13 @@ export interface SessionsRepo {
   getCancelFlag(userId: number): Promise<boolean>;
   /** Remove the cancel flag explicitly (called after a successful cancel). */
   clearCancelFlag(userId: number): Promise<void>;
+
+  /** List all MCP servers registered by a user, both enabled and disabled. */
+  listMcpServers(userId: number): Promise<McpServerRecord[]>;
+  /** Fetch one server by name. Returns null if not registered. */
+  getMcpServer(userId: number, name: string): Promise<McpServerRecord | null>;
+  /** Insert or replace a server (full overwrite — caller passes the merged record). */
+  putMcpServer(record: McpServerRecord): Promise<void>;
+  /** Remove a server. No error if it didn't exist. */
+  deleteMcpServer(userId: number, name: string): Promise<void>;
 }

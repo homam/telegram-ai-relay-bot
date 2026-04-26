@@ -1,5 +1,6 @@
 import type {
   DailyBudget,
+  McpServerRecord,
   ProviderId,
   Session,
   SessionsRepo,
@@ -11,6 +12,7 @@ export class InMemorySessionsRepo implements SessionsRepo {
   private sessions = new Map<string, Session>();
   private budgets = new Map<string, DailyBudget>();
   private cancelFlags = new Map<number, number>(); // userId → expiresAt (ms)
+  private mcpServers = new Map<string, McpServerRecord>(); // `${userId}#${name}` → record
 
   private sessionKey(userId: number, sessionId: string) {
     return `${userId}#${sessionId}`;
@@ -85,5 +87,27 @@ export class InMemorySessionsRepo implements SessionsRepo {
   }
   async clearCancelFlag(userId: number): Promise<void> {
     this.cancelFlags.delete(userId);
+  }
+
+  private mcpKey(userId: number, name: string) {
+    return `${userId}#${name}`;
+  }
+  async listMcpServers(userId: number): Promise<McpServerRecord[]> {
+    const out: McpServerRecord[] = [];
+    for (const r of this.mcpServers.values()) {
+      if (r.userId === userId) out.push({ ...r });
+    }
+    out.sort((a, b) => a.addedAt - b.addedAt);
+    return out;
+  }
+  async getMcpServer(userId: number, name: string): Promise<McpServerRecord | null> {
+    const v = this.mcpServers.get(this.mcpKey(userId, name));
+    return v ? { ...v } : null;
+  }
+  async putMcpServer(record: McpServerRecord): Promise<void> {
+    this.mcpServers.set(this.mcpKey(record.userId, record.name), { ...record });
+  }
+  async deleteMcpServer(userId: number, name: string): Promise<void> {
+    this.mcpServers.delete(this.mcpKey(userId, name));
   }
 }

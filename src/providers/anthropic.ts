@@ -8,12 +8,16 @@ import type {
   AgenticOptions,
   AIProvider,
   Citation,
+  McpServerSpec,
   ProviderReply,
   ProviderStream,
   SelectableModel,
   ToolSpec,
   UserInput,
 } from './types.js';
+
+/** Beta header required for `mcp_servers` on the Anthropic Beta Messages API. */
+const MCP_BETA = 'mcp-client-2025-04-04';
 
 /**
  * Translate our internal ToolSpec[] to Anthropic's native tool union.
@@ -51,6 +55,24 @@ function extractCitations(content: Anthropic.ContentBlock[]): Citation[] {
     }
   }
   return out;
+}
+
+/**
+ * Translate our internal McpServerSpec[] to Anthropic Beta's MCP server
+ * definitions. Returns undefined if the list is empty so we can omit the
+ * param. Each server's `name` doubles as the label the model sees in tool
+ * calls.
+ */
+function mapMcpServers(
+  servers: McpServerSpec[] | undefined,
+): Array<{ type: 'url'; name: string; url: string; authorization_token?: string }> | undefined {
+  if (!servers?.length) return undefined;
+  return servers.map((s) => ({
+    type: 'url' as const,
+    name: s.name,
+    url: s.url,
+    ...(s.authToken ? { authorization_token: s.authToken } : {}),
+  }));
 }
 
 type AnthropicMessage = { role: 'user' | 'assistant'; content: string | Anthropic.ContentBlockParam[] };
@@ -170,20 +192,35 @@ export class AnthropicProvider implements AIProvider {
     const resolved = model ?? this.defaultModel;
     const { system, messages } = this.prepare(history, userInput);
     const tools = mapTools(options?.tools);
+    const mcpServers = mapMcpServers(options?.mcpServers);
 
-    const r = await this.client.messages.create({
+    // Conditional dispatch: GA endpoint when no MCP servers (the proven
+    // path); Beta endpoint with mcp-client beta header when we need MCP.
+    // Same params shape between the two for everything else we use.
+    const baseParams = {
       model: resolved,
       max_tokens: 4096,
       system,
       messages,
       ...(tools ? { tools } : {}),
-    });
+    };
+    const r = mcpServers
+      ? await this.client.beta.messages.create({
+          ...baseParams,
+          mcp_servers: mcpServers,
+          betas: [MCP_BETA],
+        } as never)
+      : await this.client.messages.create(baseParams);
 
-    const text = r.content
+    // GA `Message.content` and Beta `BetaMessage.content` differ as types
+    // (Beta adds thinking blocks etc) but their text-block shape is the
+    // same. Cast through ContentBlock[] for unified handling.
+    const content = r.content as Anthropic.ContentBlock[];
+    const text = content
       .filter((b): b is Anthropic.TextBlock => b.type === 'text')
       .map((b) => b.text)
       .join('');
-    const citations = extractCitations(r.content);
+    const citations = extractCitations(content);
 
     return {
       text,
@@ -205,14 +242,25 @@ export class AnthropicProvider implements AIProvider {
     const resolved = model ?? this.defaultModel;
     const { system, messages } = this.prepare(history, userInput);
     const tools = mapTools(options?.tools);
+    const mcpServers = mapMcpServers(options?.mcpServers);
 
-    const stream = this.client.messages.stream({
+    const baseParams = {
       model: resolved,
       max_tokens: 4096,
       system,
       messages,
       ...(tools ? { tools } : {}),
-    });
+    };
+    // Same conditional dispatch as send() — beta endpoint only when MCP is
+    // active so we keep the prod-validated GA path untouched for the common
+    // case (web_search-only).
+    const stream = mcpServers
+      ? this.client.beta.messages.stream({
+          ...baseParams,
+          mcp_servers: mcpServers,
+          betas: [MCP_BETA],
+        } as never)
+      : this.client.messages.stream(baseParams);
 
     for await (const event of stream) {
       if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
@@ -225,7 +273,7 @@ export class AnthropicProvider implements AIProvider {
       // 🔍 status line.
     }
     const final = await stream.finalMessage();
-    const citations = extractCitations(final.content);
+    const citations = extractCitations(final.content as Anthropic.ContentBlock[]);
     return {
       model: resolved,
       usage: { input: final.usage.input_tokens, output: final.usage.output_tokens },

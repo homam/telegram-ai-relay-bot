@@ -10,6 +10,7 @@ import type {
   AgenticOptions,
   AIProvider,
   Citation,
+  McpServerSpec,
   ProviderReply,
   ProviderStream,
   SelectableModel,
@@ -18,20 +19,35 @@ import type {
 } from './types.js';
 
 /**
- * Translate our internal ToolSpec[] to Responses API native tool union.
- * Returns undefined when nothing maps so we omit the param entirely.
+ * Translate our internal ToolSpec[] + McpServerSpec[] to Responses API
+ * native tools entries. Returns undefined when nothing maps so we omit
+ * the param entirely.
  *
- * Note: SDK 4.104.0 only exposes the `web_search_preview` literal; the GA
- * `web_search` rolls in via a later SDK bump. Phase 1 wires web_search;
- * web_fetch and code_execution are gated to Phase 3.
+ * - web_search → { type: 'web_search_preview' }. SDK 4.104.0 only exposes
+ *   the *_preview literal; GA name will roll in via a later SDK bump.
+ * - Each MCP server → { type: 'mcp', server_label, server_url, headers? }.
+ *   Auto-approve every tool call: the bot is already gated by an
+ *   allowlist, so an inline-button approval round-trip would only break
+ *   the streaming UX. (Phase 4 can revisit if a per-tool toggle is wanted.)
  */
-function mapTools(tools: ToolSpec[] | undefined): Tool[] | undefined {
-  if (!tools?.length) return undefined;
+function mapTools(
+  tools: ToolSpec[] | undefined,
+  mcpServers: McpServerSpec[] | undefined,
+): Tool[] | undefined {
   const out: Tool[] = [];
-  for (const t of tools) {
+  for (const t of tools ?? []) {
     if (t.kind === 'web_search') {
       out.push({ type: 'web_search_preview' });
     }
+  }
+  for (const s of mcpServers ?? []) {
+    out.push({
+      type: 'mcp',
+      server_label: s.name,
+      server_url: s.url,
+      ...(s.authToken ? { headers: { Authorization: `Bearer ${s.authToken}` } } : {}),
+      require_approval: 'never',
+    });
   }
   return out.length ? out : undefined;
 }
@@ -181,7 +197,7 @@ export class OpenAIProvider implements AIProvider {
   ): Promise<ProviderReply> {
     const resolved = model ?? this.defaultModel;
     const { instructions, input } = this.prepare(history, userInput);
-    const tools = mapTools(options?.tools);
+    const tools = mapTools(options?.tools, options?.mcpServers);
 
     const r = await this.client.responses.create({
       model: resolved,
@@ -210,7 +226,7 @@ export class OpenAIProvider implements AIProvider {
   ): ProviderStream {
     const resolved = model ?? this.defaultModel;
     const { instructions, input } = this.prepare(history, userInput);
-    const tools = mapTools(options?.tools);
+    const tools = mapTools(options?.tools, options?.mcpServers);
 
     const stream = await this.client.responses.create({
       model: resolved,
